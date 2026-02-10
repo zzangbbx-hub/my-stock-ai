@@ -9,7 +9,7 @@ import os
 import time
 
 # 페이지 설정
-st.set_page_config(page_title="단타 전투 머신 (S-Class)", layout="wide")
+st.set_page_config(page_title="단타 전투 머신 (Master)", layout="wide")
 
 # 윈도우 폰트 깨짐 방지
 if os.name == 'nt':
@@ -20,34 +20,26 @@ if os.name == 'nt':
 if 'my_trade_log' not in st.session_state:
     st.session_state.my_trade_log = []
 
-# --- 1. 날짜 및 기초 함수 ---
-def get_latest_business_day():
-    # 현재 한국 시간(KST) 구하기
-    kst_now = datetime.utcnow() + timedelta(hours=9)
-    weekday = kst_now.weekday()
-    
-    # 주말 및 장 시작 전 처리
-    if weekday == 5: # 토요일 -> 금요일
-        target = kst_now - timedelta(days=1)
-    elif weekday == 6: # 일요일 -> 금요일
-        target = kst_now - timedelta(days=2)
-    else:
-        # 평일인데 오전 9시 전이면 -> 어제 데이터
-        if kst_now.hour < 9:
-            target = kst_now - timedelta(days=1)
-            # 어제가 일요일이면 금요일로
-            if target.weekday() == 6: target = target - timedelta(days=2)
-            # 어제가 토요일이면 금요일로
-            elif target.weekday() == 5: target = target - timedelta(days=1)
-        else: 
-            target = kst_now
-            
-    return target.strftime("%Y%m%d")
+# --- 사이드바: 날짜 및 설정 ---
+st.sidebar.title("🛠️ 컨트롤 패널")
 
-def get_date_str(date_str):
-    d = datetime.strptime(date_str, "%Y%m%d")
-    days = ["월", "화", "수", "목", "금", "토", "일"]
-    return d.strftime(f"%m월 %d일 ({days[d.weekday()]})")
+# [핵심] 날짜 자동 계산 로직 (기본값 설정용)
+kst_now = datetime.utcnow() + timedelta(hours=9)
+default_date = kst_now
+if kst_now.hour < 9: # 오전 9시 전이면 어제로
+    default_date = kst_now - timedelta(days=1)
+    if default_date.weekday() == 6: default_date -= timedelta(days=2) # 일 -> 금
+    elif default_date.weekday() == 5: default_date -= timedelta(days=1) # 토 -> 금
+
+# [핵심] 사용자가 날짜를 직접 선택 가능하게 변경
+selected_date = st.sidebar.date_input(
+    "📅 분석 기준일 선택",
+    value=default_date,
+    max_value=kst_now
+)
+target_date = selected_date.strftime("%Y%m%d")
+st.sidebar.caption(f"선택된 날짜: {target_date}")
+st.sidebar.info("💡 데이터가 안 나오면 날짜를 하루 전(평일)으로 바꿔보세요!")
 
 # --- 2. 데이터 수집 ---
 @st.cache_data(ttl=300)
@@ -59,6 +51,9 @@ def get_market_data(date_str):
         df_q = f_q.result()
         
     df = pd.concat([df_k, df_q])
+    # 데이터가 없으면 빈 껍데기 반환
+    if df.empty: return pd.DataFrame()
+    
     df = df.sort_values(by='거래대금', ascending=False).head(100)
     
     ticker_list = df.index.tolist()
@@ -89,24 +84,19 @@ def get_market_data(date_str):
 @st.cache_data(ttl=600)
 def get_investor_data(date_str):
     try:
-        # [수정됨] KOSPI, KOSDAQ 따로 호출해서 합치는 방식으로 변경 (오류 방지)
+        # [수정] 데이터 호출 방식 강화
         df_kospi = stock.get_market_net_purchases_of_equities_by_ticker(date_str, "KOSPI")
         df_kosdaq = stock.get_market_net_purchases_of_equities_by_ticker(date_str, "KOSDAQ")
         
-        # 데이터가 없을 경우 방어 코드
         if df_kospi.empty and df_kosdaq.empty:
             return pd.DataFrame()
             
         df = pd.concat([df_kospi, df_kosdaq])
-        
-        # 필요한 컬럼만 추출
         df = df[['종목명', '종가', '등락률', '외국인', '기관합계']]
         return df.sort_values(by='외국인', ascending=False)
-    except Exception as e:
-        # 에러 발생 시 빈 데이터프레임 반환
-        return pd.DataFrame()
+    except: return pd.DataFrame()
 
-# --- 3. 통합 스캐너 (점수 & 등급) ---
+# --- 3. 통합 스캐너 (S/A/B 등급) ---
 def run_all_scanners(code_list):
     results = []
     progress_bar = st.progress(0)
@@ -121,7 +111,6 @@ def run_all_scanners(code_list):
             c = df['Close']
             ma20 = c.rolling(20).mean()
             ma60 = c.rolling(60).mean()
-            
             std = c.rolling(20).std()
             upper = ma20 + (std * 2)
             lower = ma20 - (std * 2)
@@ -142,7 +131,7 @@ def run_all_scanners(code_list):
             tags = []
             score = 0
             
-            # [채점 기준]
+            # 채점
             is_uptrend = curr['Close'] > ma60.iloc[-1]
             is_support = abs(curr['Close'] - ma20.iloc[-1]) / curr['Close'] < 0.03
             if is_uptrend and is_support:
@@ -158,7 +147,7 @@ def run_all_scanners(code_list):
             if vol_ratio >= 200:
                 tags.append("💪거래폭발")
                 score += 20
-                
+            
             if band_w.iloc[-1] < 0.15:
                 tags.append("💥용수철")
                 score += 10
@@ -194,7 +183,6 @@ def run_all_scanners(code_list):
                 
     status_text.empty()
     progress_bar.empty()
-    
     results.sort(key=lambda x: x['score'], reverse=True)
     return results
 
@@ -250,20 +238,22 @@ def analyze_deep(code, name):
     except: return None, 0, 0, 0
 
 # --- 메인 UI ---
-target_date = get_latest_business_day()
-st.title(f"⚔️ 단타 전투 머신 (S-Class)")
-st.caption(f"기준: {get_date_str(target_date)}")
+# target_date는 사이드바에서 선택한 값 사용
+st.title(f"⚔️ 단타 전투 머신 (Master)")
+formatted_date = selected_date.strftime("%m월 %d일")
+st.caption(f"기준일: {formatted_date}")
 
 c1, c2, c3 = st.columns(3)
 indices = {"KOSPI": "KS11", "KOSDAQ": "KQ11", "나스닥": "NQ=F"}
 for i, (k, v) in enumerate(indices.items()):
     try:
-        d = fdr.DataReader(v).iloc[-2:]
-        val = d['Close'].iloc[-1]
-        diff = val - d['Close'].iloc[-2]
-        c1.metric(k, f"{val:.0f}", f"{diff:+.0f}") if i==0 else \
-        c2.metric(k, f"{val:.0f}", f"{diff:+.0f}") if i==1 else \
-        c3.metric(k, f"{val:.0f}", f"{diff:+.0f}")
+        d = fdr.DataReader(v).tail(5) # 넉넉하게 가져와서 확인
+        if len(d) >= 2:
+            val = d['Close'].iloc[-1]
+            diff = val - d['Close'].iloc[-2]
+            c1.metric(k, f"{val:.0f}", f"{diff:+.0f}") if i==0 else \
+            c2.metric(k, f"{val:.0f}", f"{diff:+.0f}") if i==1 else \
+            c3.metric(k, f"{val:.0f}", f"{diff:+.0f}")
     except: pass
 
 st.divider()
@@ -271,19 +261,22 @@ st.divider()
 # 데이터 로드
 all_df = get_market_data(target_date)
 
-# 탭 구성 (5개)
-tab1, tab2, tab3, tab4, tab5 = st.tabs([
-    "🏆 스나이퍼", "📡 통합 스캐너(등급)", "💰 수급 포착", "🔮 정밀 분석", "📝 매매 일지"
-])
+if all_df.empty:
+    st.error(f"⚠️ {formatted_date} 데이터가 없습니다! (휴장일이거나 장 시작 전)")
+    st.info("👈 왼쪽 사이드바에서 날짜를 하루 전으로 바꿔보세요.")
+else:
+    # 탭 구성 (5개)
+    tab1, tab2, tab3, tab4, tab5 = st.tabs([
+        "🏆 스나이퍼", "📡 통합 스캐너(등급)", "💰 수급 포착", "🔮 정밀 분석", "📝 매매 일지"
+    ])
 
-def color_surplus(val):
-    if isinstance(val, str): return 'color: black'
-    color = 'red' if val > 0 else 'blue' if val < 0 else 'black'
-    return f'color: {color}'
+    def color_surplus(val):
+        if isinstance(val, str): return 'color: black'
+        color = 'red' if val > 0 else 'blue' if val < 0 else 'black'
+        return f'color: {color}'
 
-# [Tab 1] 스나이퍼
-with tab1:
-    if not all_df.empty:
+    # [Tab 1] 스나이퍼
+    with tab1:
         st.markdown("### 🔫 오늘의 대장주")
         
         t1 = all_df['거래대금(억)'] >= 200
@@ -322,117 +315,125 @@ with tab1:
             hide_index=True, use_container_width=True
         )
 
-# [Tab 2] 통합 스캐너 (가독성 개선: 컬럼 제거 및 큰 글씨)
-with tab2:
-    st.markdown("### 📡 AI 패턴 정밀 스캔 (S/A/B 등급제)")
-    st.caption("※ 전문가 점수 기반으로 **S급 > A급 > B급** 순으로 보여줍니다.")
-    
-    if st.button("🚀 스캔 & 등급 판정"):
-        scan_codes = all_df.index.tolist()
-        results = run_all_scanners(scan_codes)
+    # [Tab 2] 통합 스캐너 (S/A/B 등급)
+    with tab2:
+        st.markdown("### 📡 AI 패턴 정밀 스캔 (S/A/B 등급제)")
+        st.caption("※ 전문가 점수 기반으로 **S급 > A급 > B급** 순으로 보여줍니다.")
         
-        if results:
-            st.toast(f"🔔 {len(results)}개 포착! S급부터 보여줍니다.", icon="🥇")
+        if st.button("🚀 스캔 & 등급 판정"):
+            scan_codes = all_df.index.tolist()
+            results = run_all_scanners(scan_codes)
             
-            for i, res in enumerate(results):
-                name = all_df.loc[res['code']]['종목명']
-                price = res['price']
-                tags = res['tags']
-                score = res['score']
+            if results:
+                st.toast(f"🔔 {len(results)}개 포착! S급부터 보여줍니다.", icon="🥇")
                 
-                # 등급 표시
-                if score >= 50:
-                    st.markdown(f"### 🔴 S급 (강력 추천) - {name}")
-                elif score >= 30:
-                    st.markdown(f"### 🟠 A급 (매수 우수) - {name}")
-                else:
-                    st.markdown(f"### 🔵 B급 (관심 단계) - {name}")
-                
-                st.write(f"**가격:** {int(price):,}원 | **점수:** {score}점")
-                st.info(f"👉 **포착 사유:** {tags}")
-                st.divider()
-        else: st.info("특이 패턴 종목이 없습니다.")
+                for i, res in enumerate(results):
+                    name = all_df.loc[res['code']]['종목명']
+                    price = res['price']
+                    tags = res['tags']
+                    score = res['score']
+                    
+                    if score >= 50:
+                        st.markdown(f"### 🔴 S급 (강력 추천) - {name}")
+                    elif score >= 30:
+                        st.markdown(f"### 🟠 A급 (매수 우수) - {name}")
+                    else:
+                        st.markdown(f"### 🔵 B급 (관심 단계) - {name}")
+                    
+                    st.write(f"**가격:** {int(price):,}원 | **점수:** {score}점")
+                    st.info(f"👉 **포착 사유:** {tags}")
+                    st.divider()
+            else: st.info("특이 패턴 종목이 없습니다.")
 
-# [Tab 3] 수급 포착 (개선됨)
-with tab3:
-    st.markdown("### 🦁 큰손들이 사는 종목")
-    if st.button("💰 수급 데이터 불러오기"):
-        with st.spinner("분석 중..."):
-            inv_df = get_investor_data(target_date)
-            if not inv_df.empty:
-                top_f = inv_df.sort_values('외국인', ascending=False).head(40)
-                top_i = inv_df.sort_values('기관합계', ascending=False).head(40)
-                both = pd.merge(top_f, top_i, on=['종목명'], suffixes=('_F', '_I'))
-                
-                if not both.empty:
-                    st.success(f"🚀 **쌍끌이(외인+기관) 포착: {len(both)}종목**")
-                    st.dataframe(both[['종목명', '등락률_F', '외국인', '기관합계']], hide_index=True)
+    # [Tab 3] 수급 포착 (오류 해결됨)
+    with tab3:
+        st.markdown(f"### 🦁 큰손들이 사는 종목 ({formatted_date})")
+        if st.button("💰 수급 데이터 불러오기"):
+            with st.spinner("분석 중..."):
+                inv_df = get_investor_data(target_date)
+                if not inv_df.empty:
+                    top_f = inv_df.sort_values('외국인', ascending=False).head(40)
+                    top_i = inv_df.sort_values('기관합계', ascending=False).head(40)
+                    both = pd.merge(top_f, top_i, on=['종목명'], suffixes=('_F', '_I'))
+                    
+                    if not both.empty:
+                        st.success(f"🚀 **쌍끌이(외인+기관) 포착: {len(both)}종목**")
+                        st.dataframe(both[['종목명', '등락률_F', '외국인', '기관합계']], hide_index=True)
+                    else:
+                        st.info("오늘 쌍끌이 매수 종목이 없습니다.")
+                        
+                    c1, c2 = st.columns(2)
+                    with c1:
+                        st.markdown("**🦁 외국인 순매수 Top**")
+                        st.dataframe(inv_df.sort_values('외국인', ascending=False).head(10)[['종목명','외국인']], hide_index=True)
+                    with c2:
+                        st.markdown("**🐯 기관 순매수 Top**")
+                        st.dataframe(inv_df.sort_values('기관합계', ascending=False).head(10)[['종목명','기관합계']], hide_index=True)
                 else:
-                    st.info("오늘 쌍끌이 매수 종목이 없습니다.")
-            else: st.error("수급 데이터 없음 (장 시작 전이거나 휴일일 수 있습니다.)")
+                    st.error(f"❌ {formatted_date} 수급 데이터가 없습니다. (휴장일 가능성)")
 
-# [Tab 4] 정밀 분석
-with tab4:
-    opts = ["선택"] + [f"{r['종목명']} ({r['종가']:,})" for i, r in all_df.head(100).iterrows()]
-    sel = st.selectbox("종목 선택", opts)
-    
-    if sel != "선택":
-        name = sel.split(' (')[0]
-        code = all_df[all_df['종목명'] == name].index[0]
-        curr = all_df.loc[code]['종가']
-        st.info(f"💰 현재가: **{curr:,}원**")
+    # [Tab 4] 정밀 분석
+    with tab4:
+        opts = ["선택"] + [f"{r['종목명']} ({r['종가']:,})" for i, r in all_df.head(100).iterrows()]
+        sel = st.selectbox("종목 선택", opts)
         
-        mode = st.radio("기준", ["주수", "금액"], horizontal=True)
-        qty = 0
-        if mode == "주수":
-            q = st.number_input("주수", 1, 10000, 10)
-            st.caption(f"필요 금액: {q*curr:,}원")
-            qty = q
-        else:
-            m = st.number_input("금액", 10000, 100000000, 1000000)
-            qty = int(m // curr)
-            st.caption(f"매수 가능: {qty:,}주")
+        if sel != "선택":
+            name = sel.split(' (')[0]
+            code = all_df[all_df['종목명'] == name].index[0]
+            curr = all_df.loc[code]['종가']
+            st.info(f"💰 현재가: **{curr:,}원**")
             
-        if st.button("⚖️ AI 최종 판결 보기"):
-            fig, rsi, fibo, vol = analyze_deep(code, name)
-            if fig:
-                score = 0
-                reasons = []
-                if 40 <= rsi <= 60: score += 20; reasons.append("안정적 흐름")
-                elif rsi < 30: score += 30; reasons.append("과매도(반등기회)")
-                elif rsi > 70: score -= 20; reasons.append("과매수(고점위험)")
-                if vol > 150: score += 30; reasons.append("거래량 폭발")
-                if all_df.loc[code]['등락률'] > 0: score += 20
+            mode = st.radio("기준", ["주수", "금액"], horizontal=True)
+            qty = 0
+            if mode == "주수":
+                q = st.number_input("주수", 1, 10000, 10)
+                st.caption(f"필요 금액: {q*curr:,}원")
+                qty = q
+            else:
+                m = st.number_input("금액", 10000, 100000000, 1000000)
+                qty = int(m // curr)
+                st.caption(f"매수 가능: {qty:,}주")
                 
-                st.divider()
-                st.subheader("🧑‍⚖️ AI 최종 판결")
-                if score >= 70: st.success(f"✅ **[진입 승인]** 강력 매수 신호! ({score}점)")
-                elif score >= 50: st.warning(f"⚠️ **[보류]** 확실하지 않습니다. ({score}점)")
-                else: st.error(f"❌ **[진입 금지]** 위험합니다. ({score}점)")
-                st.caption(f"이유: {', '.join(reasons)}")
-                
-                st.pyplot(fig)
-                
-                c1, c2, c3 = st.columns(3)
-                c1.info(f"매수: {qty:,}주")
-                c2.success(f"익절: {int(curr*1.03):,}")
-                c3.error(f"손절: {int(curr*0.98):,}")
+            if st.button("⚖️ AI 최종 판결 보기"):
+                fig, rsi, fibo, vol = analyze_deep(code, name)
+                if fig:
+                    score = 0
+                    reasons = []
+                    if 40 <= rsi <= 60: score += 20; reasons.append("안정적 흐름")
+                    elif rsi < 30: score += 30; reasons.append("과매도(반등기회)")
+                    elif rsi > 70: score -= 20; reasons.append("과매수(고점위험)")
+                    if vol > 150: score += 30; reasons.append("거래량 폭발")
+                    if all_df.loc[code]['등락률'] > 0: score += 20
+                    
+                    st.divider()
+                    st.subheader("🧑‍⚖️ AI 최종 판결")
+                    if score >= 70: st.success(f"✅ **[진입 승인]** 강력 매수 신호! ({score}점)")
+                    elif score >= 50: st.warning(f"⚠️ **[보류]** 확실하지 않습니다. ({score}점)")
+                    else: st.error(f"❌ **[진입 금지]** 위험합니다. ({score}점)")
+                    st.caption(f"이유: {', '.join(reasons)}")
+                    
+                    st.pyplot(fig)
+                    
+                    c1, c2, c3 = st.columns(3)
+                    c1.info(f"매수: {qty:,}주")
+                    c2.success(f"익절: {int(curr*1.03):,}")
+                    c3.error(f"손절: {int(curr*0.98):,}")
 
-# [Tab 5] 매매 일지
-with tab5:
-    st.markdown("### 📝 매매 복기장")
-    with st.form("trade_form"):
-        c1, c2, c3 = st.columns(3)
-        t_name = c1.text_input("종목명")
-        t_buy = c2.number_input("매수가", 0)
-        t_sell = c3.number_input("매도가", 0)
-        memo = st.text_area("메모")
-        if st.form_submit_button("기록"):
-            p = (t_sell - t_buy)*100/t_buy if t_buy > 0 else 0
-            st.session_state.my_trade_log.append({
-                "날짜": datetime.now().strftime("%Y-%m-%d"),
-                "종목": t_name, "수익률": f"{p:.2f}%", "메모": memo
-            })
-            st.success("저장!")
-    if st.session_state.my_trade_log:
-        st.dataframe(pd.DataFrame(st.session_state.my_trade_log), use_container_width=True)
+    # [Tab 5] 매매 일지
+    with tab5:
+        st.markdown("### 📝 매매 복기장")
+        with st.form("trade_form"):
+            c1, c2, c3 = st.columns(3)
+            t_name = c1.text_input("종목명")
+            t_buy = c2.number_input("매수가", 0)
+            t_sell = c3.number_input("매도가", 0)
+            memo = st.text_area("메모")
+            if st.form_submit_button("기록"):
+                p = (t_sell - t_buy)*100/t_buy if t_buy > 0 else 0
+                st.session_state.my_trade_log.append({
+                    "날짜": datetime.now().strftime("%Y-%m-%d"),
+                    "종목": t_name, "수익률": f"{p:.2f}%", "메모": memo
+                })
+                st.success("저장!")
+        if st.session_state.my_trade_log:
+            st.dataframe(pd.DataFrame(st.session_state.my_trade_log), use_container_width=True)
