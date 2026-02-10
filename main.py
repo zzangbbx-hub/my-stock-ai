@@ -10,7 +10,7 @@ import requests
 import time
 
 # 페이지 설정
-st.set_page_config(page_title="단타 전투 머신 (Real-Time)", layout="wide")
+st.set_page_config(page_title="단타 전투 머신 (Final Engine)", layout="wide")
 
 # 윈도우 폰트 깨짐 방지
 if os.name == 'nt':
@@ -30,7 +30,6 @@ display_date = kst_now.strftime("%m월 %d일")
 @st.cache_data(ttl=300)
 def get_market_data():
     target_date = today_str
-    # 오전 9시 전이면 어제 날짜로 (시초가 갭 계산용)
     if kst_now.hour < 9:
         d = kst_now - timedelta(days=1)
         if d.weekday() == 6: d -= timedelta(days=2)
@@ -73,72 +72,70 @@ def get_market_data():
 
     return df
 
-# --- [핵심] 네이버 금융 실시간 크롤링 (강력 뚫기) ---
-@st.cache_data(ttl=300) # 5분마다 갱신
-def get_naver_realtime_supply():
-    # 네이버 '외국인/기관 순매수 상위' 페이지
-    url_foreign = "https://finance.naver.com/sise/sise_deal_rank.naver?investor_gubun=9000&type=buy" # 외국인
-    url_inst = "https://finance.naver.com/sise/sise_deal_rank.naver?investor_gubun=1000&type=buy"   # 기관
+# --- [핵심] 네이버 금융 크롤링 (강력한 파싱 로직) ---
+@st.cache_data(ttl=600)
+def get_naver_supply():
+    # 9000: 외국인, 1000: 기관
+    url_foreign = "https://finance.naver.com/sise/sise_deal_rank.naver?investor_gubun=9000&type=buy"
+    url_inst = "https://finance.naver.com/sise/sise_deal_rank.naver?investor_gubun=1000&type=buy"
     
-    # [필살기] 완벽한 브라우저 위장 헤더
+    # 진짜 브라우저인 척 헤더 위장
     headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Referer': 'https://finance.naver.com/',
-        'Accept-Language': 'ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7'
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+        'Referer': 'https://finance.naver.com/'
     }
     
-    def fetch_table(url):
+    def fetch_and_parse(url):
         try:
-            res = requests.get(url, headers=headers, timeout=5)
-            # 인코딩 강제 설정 (네이버는 euc-kr)
-            res.encoding = 'euc-kr' 
+            res = requests.get(url, headers=headers)
+            res.raise_for_status()
+            # 인코딩 설정 (네이버는 euc-kr)
+            dfs = pd.read_html(res.text, encoding='euc-kr')
             
-            # HTML 파싱
-            dfs = pd.read_html(res.text, attrs={"class": "type_2"})
-            if not dfs: return pd.DataFrame()
+            # [핵심] 표가 여러 개일 때 '종목명'이 있는 진짜 표를 찾음
+            target_df = pd.DataFrame()
+            for df in dfs:
+                # 컬럼에 종목명이 있거나, 데이터 중에 종목명이 포함된 경우
+                if '종목명' in df.columns or df.iloc[0].astype(str).str.contains('종목명').any():
+                    target_df = df
+                    break
             
-            df = dfs[0]
-            # 데이터 정제 (빈값 제거)
-            df = df.dropna(how='all')
-            # '순위'가 숫자인 행만 살림 (헤더 제거)
-            df = df[pd.to_numeric(df.iloc[:, 0], errors='coerce').notnull()]
+            if target_df.empty and len(dfs) >= 2:
+                target_df = dfs[1] # 보통 2번째 표가 데이터임
+                
+            # 데이터 정제
+            target_df = target_df.dropna(how='all') # 빈 줄 제거
             
-            # 컬럼 추출 (순위, 종목명, ... , 순매수량)
-            # 네이버 구조: 1(종목명), 4(등락률), -1(순매수량)
-            result = df.iloc[:, [1, 4, -1]].copy()
-            result.columns = ['종목명', '등락률', '수급량']
+            # 컬럼 이름이 꼬였을 경우 강제 매핑 (순매수량 기준)
+            if '순매수량' not in target_df.columns:
+                # 네이버 구조상 보통 1열: 순위, 2열: 종목명, ... 마지막: 순매수량
+                target_df = target_df.iloc[:, [1, 2, 3, -1]] # 종목명, 현재가, 등락률, 순매수량(추정)
+            else:
+                 target_df = target_df[['종목명', '현재가', '등락률', '순매수량']]
+                 
+            target_df.columns = ['종목명', '현재가', '등락률', '수급량']
+            target_df = target_df.dropna(subset=['종목명'])
             
-            # 텍스트 정리
-            result['종목명'] = result['종목명'].astype(str).str.strip()
+            # 숫자형 변환 (콤마 제거)
+            target_df['수급량'] = target_df['수급량'].astype(str).str.replace(',', '', regex=True)
+            target_df['수급량'] = pd.to_numeric(target_df['수급량'], errors='coerce')
             
-            # 숫자 변환 함수
-            def to_num(x):
-                try:
-                    return int(str(x).replace(',', '').replace('+', '').replace('%', '').strip())
-                except:
-                    return 0
-            
-            # 등락률은 float, 수급량은 int
-            def to_float(x):
-                try: return float(str(x).replace('%', '').strip())
-                except: return 0.0
-
-            result['등락률'] = result['등락률'].apply(to_float)
-            result['수급량'] = result['수급량'].apply(to_num)
-            
-            return result.head(20) # 상위 20개만
-            
+            return target_df
         except Exception as e:
             return pd.DataFrame()
 
-    # 병렬 호출
-    with concurrent.futures.ThreadPoolExecutor() as executor:
-        future_f = executor.submit(fetch_table, url_foreign)
-        future_i = executor.submit(fetch_table, url_inst)
-        df_f = future_f.result()
-        df_i = future_i.result()
-        
-    return df_f, df_i
+    df_f = fetch_and_parse(url_foreign)
+    df_i = fetch_and_parse(url_inst)
+    
+    # 합치기 (종목명 기준)
+    if not df_f.empty and not df_i.empty:
+        merged = pd.merge(df_f[['종목명', '현재가', '등락률', '수급량']], df_i[['종목명', '수급량']], on='종목명', suffixes=('_F', '_I'))
+        merged.rename(columns={'수급량_F': '외국인', '수급량_I': '기관'}, inplace=True)
+        # 외국인 수량 기준 내림차순
+        merged = merged.sort_values(by='외국인', ascending=False)
+        return df_f, df_i, merged
+    else:
+        return df_f, df_i, pd.DataFrame()
 
 # --- 3. 통합 스캐너 ---
 def run_all_scanners(code_list):
@@ -156,7 +153,9 @@ def run_all_scanners(code_list):
             ma20 = c.rolling(20).mean()
             ma60 = c.rolling(60).mean()
             std = c.rolling(20).std()
-            band_w = ((ma20 + (std*2)) - (ma20 - (std*2))) / ma20
+            upper = ma20 + (std * 2)
+            lower = ma20 - (std * 2)
+            band_w = (upper - lower) / ma20
             
             curr = df.iloc[-1]
             prev = df.iloc[-2]
@@ -164,19 +163,26 @@ def run_all_scanners(code_list):
             vol_avg = df['Volume'].rolling(5).mean().iloc[-1]
             vol_ratio = (curr['Volume'] / vol_avg) * 100 if vol_avg > 0 else 0
             
-            rsi = 100 - (100 / (1 + (c.diff().clip(lower=0).rolling(14).mean() / (-c.diff().clip(upper=0).rolling(14).mean()).replace(0, 1e-9)))).iloc[-1]
+            delta = c.diff()
+            gain = (delta.where(delta > 0, 0)).rolling(14).mean()
+            loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
+            rs = gain / loss
+            rsi = 100 - (100 / (1 + rs)).iloc[-1]
             
             tags = []
             score = 0
             
-            # [채점 기준]
-            if curr['Close'] > ma60.iloc[-1] and abs(curr['Close'] - ma20.iloc[-1])/curr['Close'] < 0.03:
+            is_uptrend = curr['Close'] > ma60.iloc[-1]
+            is_support = abs(curr['Close'] - ma20.iloc[-1]) / curr['Close'] < 0.03
+            if is_uptrend and is_support:
                 tags.append("🛡️안전빵")
                 score += 40
             
-            if len(df) >= 3 and df.iloc[-3]['Close'] > df.iloc[-3]['Open'] and prev['Close'] < prev['Open'] and curr['Close'] > curr['Open']:
-                tags.append("🕯️양음양")
-                score += 30
+            if len(df) >= 3:
+                p2 = df.iloc[-3]
+                if p2['Close'] > p2['Open'] and prev['Close'] < prev['Open'] and curr['Close'] > curr['Open']:
+                    tags.append("🕯️양음양")
+                    score += 30
 
             if vol_ratio >= 200:
                 tags.append("💪거래폭발")
@@ -186,7 +192,8 @@ def run_all_scanners(code_list):
                 tags.append("💥용수철")
                 score += 10
             
-            if (curr['Open'] - prev['Close']) / prev['Close'] >= 0.03:
+            gap = (curr['Open'] - prev['Close']) / prev['Close']
+            if gap >= 0.03:
                 tags.append("🚀갭상승")
                 score += 10
 
@@ -207,7 +214,7 @@ def run_all_scanners(code_list):
             if i % 2 == 0:
                 prog = (i + 1) / total
                 progress_bar.progress(prog)
-                status_text.caption(f"⚡ AI 분석 중... ({i+1}/{total})")
+                status_text.caption(f"⚡ AI 등급 심사 중... ({i+1}/{total})")
                 
     status_text.empty()
     progress_bar.empty()
@@ -224,8 +231,18 @@ def analyze_deep(code, name):
         loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
         rs = gain / loss
         rsi = 100 - (100 / (1 + rs))
+        curr_rsi = rsi.iloc[-1]
         
-        fibo_618 = df['High'].tail(60).max() - ((df['High'].tail(60).max() - df['Low'].tail(60).min()) * 0.618)
+        high_p = df['High'].tail(60).max()
+        low_p = df['Low'].tail(60).min()
+        fibo_618 = high_p - ((high_p - low_p) * 0.618)
+        
+        vol_ratio = (df['Volume'].iloc[-1] / df['Volume'].tail(5).mean()) * 100
+        
+        df['Weekday'] = df.index.day_name()
+        weekday_stats = df.groupby('Weekday')['Close'].apply(lambda x: x.pct_change().mean() * 100)
+        days_order = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday']
+        weekday_stats = weekday_stats.reindex(days_order)
         
         fig = plt.figure(figsize=(10, 10))
         gs = fig.add_gridspec(3, 1, height_ratios=[3, 1, 1])
@@ -242,15 +259,22 @@ def analyze_deep(code, name):
         ax2.plot(df.index, rsi, color='purple', label='RSI')
         ax2.axhline(70, color='red', linestyle='--')
         ax2.axhline(30, color='blue', linestyle='--')
+        ax2.legend()
         ax2.grid(alpha=0.3)
         
+        ax3 = fig.add_subplot(gs[2])
+        colors = ['red' if v > 0 else 'blue' for v in weekday_stats.fillna(0).values]
+        ax3.bar(weekday_stats.index.str[:3], weekday_stats.fillna(0).values, color=colors)
+        ax3.set_title("Weekday Return (%)")
+        ax3.grid(alpha=0.3)
+        
         plt.tight_layout()
-        return fig
-    except: return None
+        return fig, curr_rsi, fibo_618, vol_ratio
+    except: return None, 0, 0, 0
 
 # --- 메인 UI ---
-st.title(f"⚔️ 단타 전투 머신 (Real-Time)")
-st.caption(f"접속 시간: {kst_now.strftime('%H시 %M분')} (실시간 모드)")
+st.title(f"⚔️ 단타 전투 머신 (Final Engine)")
+st.caption(f"접속일: {display_date}")
 
 c1, c2, c3 = st.columns(3)
 indices = {"KOSPI": "KS11", "KOSDAQ": "KQ11", "나스닥": "NQ=F"}
@@ -270,10 +294,10 @@ st.divider()
 all_df = get_market_data()
 
 if all_df.empty:
-    st.error("⚠️ 시세 데이터를 불러오지 못했습니다.")
+    st.error("⚠️ 시세 데이터를 불러오지 못했습니다. 잠시 후 새로고침 해주세요.")
 else:
     tab1, tab2, tab3, tab4, tab5 = st.tabs([
-        "🏆 스나이퍼", "📡 통합 스캐너", "💰 수급 포착(실시간)", "🔮 정밀 분석", "📝 매매 일지"
+        "🏆 스나이퍼", "📡 통합 스캐너(등급)", "💰 수급 포착(네이버)", "🔮 정밀 분석", "📝 매매 일지"
     ])
 
     def color_surplus(val):
@@ -304,9 +328,18 @@ else:
         i4.metric("대금", f"{best['거래대금(억)']}억")
         
         st.divider()
-        st.caption("※ 거래대금 Top 100")
+        c_sort, c_blank = st.columns([1, 4])
+        with c_sort:
+            sort_opt = st.radio("정렬 기준", ["거래대금순", "등락률순"], horizontal=True)
+            
+        view_df = all_df.copy()
+        if sort_opt == "등락률순":
+            view_df = view_df.sort_values(by='등락률', ascending=False)
+        else:
+            view_df = view_df.sort_values(by='거래대금(억)', ascending=False)
+            
         st.dataframe(
-            all_df[['종목명', '종가', '등락률', '신호', '거래대금(억)']].style
+            view_df[['종목명', '종가', '등락률', '신호', '거래대금(억)']].style
             .format({'종가': '{:,}', '거래대금(억)': '{:,}', '등락률': '{:.2f}%'})
             .map(color_surplus, subset=['등락률']), 
             hide_index=True, use_container_width=True
@@ -315,12 +348,14 @@ else:
     # [Tab 2] 통합 스캐너
     with tab2:
         st.markdown("### 📡 AI 패턴 정밀 스캔")
+        st.caption("※ **S급(50점+) > A급(30점+) > B급** 순으로 보여줍니다.")
+        
         if st.button("🚀 스캔 & 등급 판정"):
             scan_codes = all_df.index.tolist()
             results = run_all_scanners(scan_codes)
             
             if results:
-                st.toast(f"🔔 {len(results)}개 포착!", icon="🥇")
+                st.toast(f"🔔 {len(results)}개 포착! S급부터 보여줍니다.", icon="🥇")
                 for res in results:
                     name = all_df.loc[res['code']]['종목명']
                     price = res['price']
@@ -336,54 +371,30 @@ else:
                     st.divider()
             else: st.info("특이 패턴 종목이 없습니다.")
 
-    # [Tab 3] 수급 포착 (실시간 네이버)
+    # [Tab 3] 수급 포착 (네이버 금융 연동)
     with tab3:
-        st.markdown("### 🦁 실시간 수급 랭킹 (네이버 금융)")
-        st.caption("※ **오래된 데이터는 버리고, 지금 네이버에 떠 있는 진짜 순위**를 가져옵니다.")
+        st.markdown("### 🦁 네이버 금융 수급 랭킹")
+        st.caption("※ 네이버 금융에서 **실시간 상위 종목**을 긁어옵니다. (무조건 뜸)")
         
-        if st.button("💰 실시간 데이터 긁어오기"):
-            with st.spinner("네이버 금융 침투 중..."):
-                df_f, df_i = get_naver_realtime_supply()
-                
-                # 쌍끌이 계산
-                merged = pd.DataFrame()
-                if not df_f.empty and not df_i.empty:
-                    merged = pd.merge(df_f, df_i, on='종목명', suffixes=('_F', '_I'))
-                    # 외국인+기관 수량 합계로 정렬
-                    merged['합계'] = merged['수급량_F'] + merged['수급량_I']
-                    merged = merged.sort_values(by='합계', ascending=False)
+        if st.button("💰 수급 데이터 불러오기"):
+            with st.spinner("네이버 금융 접속 중..."):
+                df_f, df_i, merged = get_naver_supply()
                 
                 if not merged.empty:
                     st.success(f"🚀 **쌍끌이(외인+기관) 포착: {len(merged)}종목**")
-                    st.dataframe(
-                        merged[['종목명', '등락률_F', '수급량_F', '수급량_I']].rename(
-                            columns={'등락률_F':'등락률', '수급량_F':'외국인', '수급량_I':'기관'}
-                        ).style.format({'외국인':'{:,}', '기관':'{:,}', '등락률':'{:.2f}%'})
-                        .map(color_surplus, subset=['등락률']),
-                        hide_index=True, use_container_width=True
-                    )
+                    st.dataframe(merged, hide_index=True, use_container_width=True)
                 else:
-                    st.info("현재 쌍끌이(동시 매수) 종목이 없습니다.")
+                    st.info("쌍끌이 종목이 없거나 데이터를 가져오지 못했습니다.")
                 
                 c1, c2 = st.columns(2)
                 with c1:
-                    st.markdown("**🦁 외국인 순매수 Top**")
-                    if not df_f.empty: 
-                        st.dataframe(
-                            df_f[['종목명', '등락률', '수급량']].style.format({'수급량':'{:,}', '등락률':'{:.2f}%'})
-                            .map(color_surplus, subset=['등락률']), 
-                            hide_index=True
-                        )
-                    else: st.error("외국인 데이터 수신 실패")
+                    st.markdown("**🦁 외국인 순매수 Top 10**")
+                    if not df_f.empty: st.dataframe(df_f[['종목명', '수급량']].head(10), hide_index=True)
+                    else: st.error("데이터 없음")
                 with c2:
-                    st.markdown("**🐯 기관 순매수 Top**")
-                    if not df_i.empty: 
-                        st.dataframe(
-                            df_i[['종목명', '등락률', '수급량']].style.format({'수급량':'{:,}', '등락률':'{:.2f}%'})
-                            .map(color_surplus, subset=['등락률']), 
-                            hide_index=True
-                        )
-                    else: st.error("기관 데이터 수신 실패")
+                    st.markdown("**🐯 기관 순매수 Top 10**")
+                    if not df_i.empty: st.dataframe(df_i[['종목명', '수급량']].head(10), hide_index=True)
+                    else: st.error("데이터 없음")
 
     # [Tab 4] 정밀 분석
     with tab4:
@@ -408,9 +419,25 @@ else:
                 st.caption(f"매수 가능: {qty:,}주")
                 
             if st.button("⚖️ AI 최종 판결 보기"):
-                fig = analyze_deep(code, name)
+                fig, rsi, fibo, vol = analyze_deep(code, name)
                 if fig:
+                    score = 0
+                    reasons = []
+                    if 40 <= rsi <= 60: score += 20; reasons.append("안정적 흐름")
+                    elif rsi < 30: score += 30; reasons.append("과매도(반등기회)")
+                    elif rsi > 70: score -= 20; reasons.append("과매수(고점위험)")
+                    if vol > 150: score += 30; reasons.append("거래량 폭발")
+                    if all_df.loc[code]['등락률'] > 0: score += 20
+                    
+                    st.divider()
+                    st.subheader("🧑‍⚖️ AI 최종 판결")
+                    if score >= 70: st.success(f"✅ **[진입 승인]** 강력 매수 신호! ({score}점)")
+                    elif score >= 50: st.warning(f"⚠️ **[보류]** 확실하지 않습니다. ({score}점)")
+                    else: st.error(f"❌ **[진입 금지]** 위험합니다. ({score}점)")
+                    st.caption(f"이유: {', '.join(reasons)}")
+                    
                     st.pyplot(fig)
+                    
                     c1, c2, c3 = st.columns(3)
                     c1.info(f"매수: {qty:,}주")
                     c2.success(f"익절: {int(curr*1.03):,}")
