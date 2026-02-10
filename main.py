@@ -22,15 +22,26 @@ if 'my_trade_log' not in st.session_state:
 
 # --- 1. 날짜 및 기초 함수 ---
 def get_latest_business_day():
+    # 현재 한국 시간(KST) 구하기
     kst_now = datetime.utcnow() + timedelta(hours=9)
     weekday = kst_now.weekday()
-    if weekday == 5: target = kst_now - timedelta(days=1)
-    elif weekday == 6: target = kst_now - timedelta(days=2)
+    
+    # 주말 및 장 시작 전 처리
+    if weekday == 5: # 토요일 -> 금요일
+        target = kst_now - timedelta(days=1)
+    elif weekday == 6: # 일요일 -> 금요일
+        target = kst_now - timedelta(days=2)
     else:
+        # 평일인데 오전 9시 전이면 -> 어제 데이터
         if kst_now.hour < 9:
             target = kst_now - timedelta(days=1)
-            if target.weekday() >= 5: target = target - timedelta(days=(target.weekday() - 4))
-        else: target = kst_now
+            # 어제가 일요일이면 금요일로
+            if target.weekday() == 6: target = target - timedelta(days=2)
+            # 어제가 토요일이면 금요일로
+            elif target.weekday() == 5: target = target - timedelta(days=1)
+        else: 
+            target = kst_now
+            
     return target.strftime("%Y%m%d")
 
 def get_date_str(date_str):
@@ -78,10 +89,22 @@ def get_market_data(date_str):
 @st.cache_data(ttl=600)
 def get_investor_data(date_str):
     try:
-        df = stock.get_market_net_purchases_of_equities_by_ticker(date_str, "ALL")
+        # [수정됨] KOSPI, KOSDAQ 따로 호출해서 합치는 방식으로 변경 (오류 방지)
+        df_kospi = stock.get_market_net_purchases_of_equities_by_ticker(date_str, "KOSPI")
+        df_kosdaq = stock.get_market_net_purchases_of_equities_by_ticker(date_str, "KOSDAQ")
+        
+        # 데이터가 없을 경우 방어 코드
+        if df_kospi.empty and df_kosdaq.empty:
+            return pd.DataFrame()
+            
+        df = pd.concat([df_kospi, df_kosdaq])
+        
+        # 필요한 컬럼만 추출
         df = df[['종목명', '종가', '등락률', '외국인', '기관합계']]
         return df.sort_values(by='외국인', ascending=False)
-    except: return pd.DataFrame()
+    except Exception as e:
+        # 에러 발생 시 빈 데이터프레임 반환
+        return pd.DataFrame()
 
 # --- 3. 통합 스캐너 (점수 & 등급) ---
 def run_all_scanners(code_list):
@@ -120,26 +143,22 @@ def run_all_scanners(code_list):
             score = 0
             
             # [채점 기준]
-            # 1. 안전빵 (40점) - 킹갓제너럴 패턴
             is_uptrend = curr['Close'] > ma60.iloc[-1]
             is_support = abs(curr['Close'] - ma20.iloc[-1]) / curr['Close'] < 0.03
             if is_uptrend and is_support:
                 tags.append("🛡️안전빵")
                 score += 40
             
-            # 2. 양음양 (30점) - 확실한 눌림목
             if len(df) >= 3:
                 p2 = df.iloc[-3]
                 if p2['Close'] > p2['Open'] and prev['Close'] < prev['Open'] and curr['Close'] > curr['Open']:
                     tags.append("🕯️양음양")
                     score += 30
 
-            # 3. 거래폭발 (20점) - 세력 개입
             if vol_ratio >= 200:
                 tags.append("💪거래폭발")
                 score += 20
                 
-            # 4. 기타 보조지표 (10점씩)
             if band_w.iloc[-1] < 0.15:
                 tags.append("💥용수철")
                 score += 10
@@ -176,7 +195,6 @@ def run_all_scanners(code_list):
     status_text.empty()
     progress_bar.empty()
     
-    # 점수 높은 순 정렬
     results.sort(key=lambda x: x['score'], reverse=True)
     return results
 
@@ -304,7 +322,7 @@ with tab1:
             hide_index=True, use_container_width=True
         )
 
-# [Tab 2] 통합 스캐너 (등급 글씨 크게)
+# [Tab 2] 통합 스캐너 (가독성 개선: 컬럼 제거 및 큰 글씨)
 with tab2:
     st.markdown("### 📡 AI 패턴 정밀 스캔 (S/A/B 등급제)")
     st.caption("※ 전문가 점수 기반으로 **S급 > A급 > B급** 순으로 보여줍니다.")
@@ -322,40 +340,20 @@ with tab2:
                 tags = res['tags']
                 score = res['score']
                 
-                # [NEW] 등급 표시 (텍스트로 크게)
-                grade_title = ""
-                grade_color = ""
-                
+                # 등급 표시
                 if score >= 50:
-                    grade_title = "👑 S급"
-                    desc = "강력 추천"
-                    grade_color = "red"
+                    st.markdown(f"### 🔴 S급 (강력 추천) - {name}")
                 elif score >= 30:
-                    grade_title = "🥇 A급"
-                    desc = "매수 우수"
-                    grade_color = "orange"
+                    st.markdown(f"### 🟠 A급 (매수 우수) - {name}")
                 else:
-                    grade_title = "🥈 B급"
-                    desc = "관심 단계"
-                    grade_color = "blue"
+                    st.markdown(f"### 🔵 B급 (관심 단계) - {name}")
                 
-                with st.container():
-                    c1, c2 = st.columns([1.2, 4])
-                    
-                    # 왼쪽: 등급 (크게)
-                    with c1:
-                        st.markdown(f"### :{grade_color}[{grade_title}]")
-                        st.caption(f"**{desc}**\n({score}점)")
-                        
-                    # 오른쪽: 정보
-                    with c2:
-                        st.markdown(f"**[{name}]** `{int(price):,}원`")
-                        st.info(f"{tags}")
-                    
-                    st.divider()
+                st.write(f"**가격:** {int(price):,}원 | **점수:** {score}점")
+                st.info(f"👉 **포착 사유:** {tags}")
+                st.divider()
         else: st.info("특이 패턴 종목이 없습니다.")
 
-# [Tab 3] 수급 포착
+# [Tab 3] 수급 포착 (개선됨)
 with tab3:
     st.markdown("### 🦁 큰손들이 사는 종목")
     if st.button("💰 수급 데이터 불러오기"):
@@ -371,7 +369,7 @@ with tab3:
                     st.dataframe(both[['종목명', '등락률_F', '외국인', '기관합계']], hide_index=True)
                 else:
                     st.info("오늘 쌍끌이 매수 종목이 없습니다.")
-            else: st.error("수급 데이터 없음")
+            else: st.error("수급 데이터 없음 (장 시작 전이거나 휴일일 수 있습니다.)")
 
 # [Tab 4] 정밀 분석
 with tab4:
