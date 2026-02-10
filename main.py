@@ -304,7 +304,7 @@ with tab1:
             hide_index=True, use_container_width=True
         )
 
-# [Tab 2] 통합 스캐너 (등급 글씨 크게)
+# [Tab 2] 통합 스캐너 (가독성 개선: 컬럼 제거 및 큰 글씨)
 with tab2:
     st.markdown("### 📡 AI 패턴 정밀 스캔 (S/A/B 등급제)")
     st.caption("※ 전문가 점수 기반으로 **S급 > A급 > B급** 순으로 보여줍니다.")
@@ -322,37 +322,17 @@ with tab2:
                 tags = res['tags']
                 score = res['score']
                 
-                # [NEW] 등급 표시 (텍스트로 크게)
-                grade_title = ""
-                grade_color = ""
-                
+                # [NEW] 화면 꽉 차게 큰 글씨로 표시 (컬럼 제거)
                 if score >= 50:
-                    grade_title = "👑 S급"
-                    desc = "강력 추천"
-                    grade_color = "red"
+                    st.markdown(f"### 🔴 S급 (강력 추천) - {name}")
                 elif score >= 30:
-                    grade_title = "🥇 A급"
-                    desc = "매수 우수"
-                    grade_color = "orange"
+                    st.markdown(f"### 🟠 A급 (매수 우수) - {name}")
                 else:
-                    grade_title = "🥈 B급"
-                    desc = "관심 단계"
-                    grade_color = "blue"
+                    st.markdown(f"### 🔵 B급 (관심 단계) - {name}")
                 
-                with st.container():
-                    c1, c2 = st.columns([1.2, 4])
-                    
-                    # 왼쪽: 등급 (크게)
-                    with c1:
-                        st.markdown(f"### :{grade_color}[{grade_title}]")
-                        st.caption(f"**{desc}**\n({score}점)")
-                        
-                    # 오른쪽: 정보
-                    with c2:
-                        st.markdown(f"**[{name}]** `{int(price):,}원`")
-                        st.info(f"{tags}")
-                    
-                    st.divider()
+                st.write(f"**가격:** {int(price):,}원 | **점수:** {score}점")
+                st.info(f"👉 **포착 사유:** {tags}")
+                st.divider()
         else: st.info("특이 패턴 종목이 없습니다.")
 
 # [Tab 3] 수급 포착
