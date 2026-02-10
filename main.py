@@ -313,4 +313,81 @@ with tab2:
 # [Tab 3] 수급 포착 (기존 기능)
 with tab3:
     st.markdown("### 🦁 큰손들이 사는 종목")
-    if st.button("💰 수급 데이터 불러
+    if st.button("💰 수급 데이터 불러오기"):
+        with st.spinner("분석 중..."):
+            inv_df = get_investor_data(target_date)
+            if not inv_df.empty:
+                top_f = inv_df.sort_values('외국인', ascending=False).head(40)
+                top_i = inv_df.sort_values('기관합계', ascending=False).head(40)
+                both = pd.merge(top_f, top_i, on=['종목명'], suffixes=('_F', '_I'))
+                
+                st.success(f"🚀 **쌍끌이(외인+기관) 포착: {len(both)}종목**")
+                st.dataframe(both[['종목명', '등락률_F', '외국인', '기관합계']], hide_index=True)
+            else: st.error("수급 데이터 없음")
+
+# [Tab 4] 정밀 분석 (AI 판결 점수 복구)
+with tab4:
+    opts = ["선택"] + [f"{r['종목명']} ({r['종가']:,})" for i, r in all_df.head(100).iterrows()]
+    sel = st.selectbox("종목 선택", opts)
+    
+    if sel != "선택":
+        name = sel.split(' (')[0]
+        code = all_df[all_df['종목명'] == name].index[0]
+        curr = all_df.loc[code]['종가']
+        st.info(f"💰 현재가: **{curr:,}원**")
+        
+        mode = st.radio("기준", ["주수", "금액"], horizontal=True)
+        qty = 0
+        if mode == "주수":
+            q = st.number_input("주수", 1, 10000, 10)
+            st.caption(f"필요 금액: {q*curr:,}원")
+            qty = q
+        else:
+            m = st.number_input("금액", 10000, 100000000, 1000000)
+            qty = int(m // curr)
+            st.caption(f"매수 가능: {qty:,}주")
+            
+        if st.button("⚖️ AI 최종 판결 보기"):
+            fig, rsi, fibo, vol = analyze_deep(code, name)
+            if fig:
+                # 점수 로직 (복구)
+                score = 0
+                reasons = []
+                if 40 <= rsi <= 60: score += 20; reasons.append("안정적 흐름")
+                elif rsi < 30: score += 30; reasons.append("과매도(반등기회)")
+                elif rsi > 70: score -= 20; reasons.append("과매수(고점위험)")
+                if vol > 150: score += 30; reasons.append("거래량 폭발")
+                if all_df.loc[code]['등락률'] > 0: score += 20
+                
+                st.divider()
+                st.subheader("🧑‍⚖️ AI 최종 판결")
+                if score >= 70: st.success(f"✅ **[진입 승인]** 강력 매수 신호! ({score}점)")
+                elif score >= 50: st.warning(f"⚠️ **[보류]** 확실하지 않습니다. ({score}점)")
+                else: st.error(f"❌ **[진입 금지]** 위험합니다. ({score}점)")
+                st.caption(f"이유: {', '.join(reasons)}")
+                
+                st.pyplot(fig)
+                
+                c1, c2, c3 = st.columns(3)
+                c1.info(f"매수: {qty:,}주")
+                c2.success(f"익절: {int(curr*1.03):,}")
+                c3.error(f"손절: {int(curr*0.98):,}")
+
+# [Tab 5] 매매 일지 (신규 유지)
+with tab5:
+    st.markdown("### 📝 매매 복기장")
+    with st.form("trade_log"):
+        c1, c2, c3 = st.columns(3)
+        t_name = c1.text_input("종목명")
+        t_buy = c2.number_input("매수가", 0)
+        t_sell = c3.number_input("매도가", 0)
+        memo = st.text_area("메모")
+        if st.form_submit_button("기록"):
+            p = (t_sell - t_buy)*100/t_buy if t_buy > 0 else 0
+            st.session_state.trade_log.append({
+                "날짜": datetime.now().strftime("%Y-%m-%d"),
+                "종목": t_name, "수익률": f"{p:.2f}%", "메모": memo
+            })
+            st.success("저장!")
+    if st.session_state.trade_log:
+        st.dataframe(pd.DataFrame(st.session_state.trade_log), use_container_width=True)
