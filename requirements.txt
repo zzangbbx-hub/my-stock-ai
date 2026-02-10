@@ -7,4 +7,3 @@ plotly
 numpy
 requests
 lxml
-concurrent-futures
