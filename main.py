@@ -7,10 +7,10 @@ import matplotlib.pyplot as plt
 import concurrent.futures
 import os
 import requests
-import time
+import re
 
 # 페이지 설정
-st.set_page_config(page_title="단타 전투 머신 (Final Engine)", layout="wide")
+st.set_page_config(page_title="단타 전투 머신 (Naver Pro)", layout="wide")
 
 # 윈도우 폰트 깨짐 방지
 if os.name == 'nt':
@@ -72,70 +72,73 @@ def get_market_data():
 
     return df
 
-# --- [핵심] 네이버 금융 크롤링 (강력한 파싱 로직) ---
+# --- [핵심 수정] 네이버 금융 정밀 크롤링 ---
 @st.cache_data(ttl=600)
 def get_naver_supply():
-    # 9000: 외국인, 1000: 기관
     url_foreign = "https://finance.naver.com/sise/sise_deal_rank.naver?investor_gubun=9000&type=buy"
     url_inst = "https://finance.naver.com/sise/sise_deal_rank.naver?investor_gubun=1000&type=buy"
     
-    # 진짜 브라우저인 척 헤더 위장
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-        'Referer': 'https://finance.naver.com/'
-    }
+    headers = {'User-Agent': 'Mozilla/5.0'}
     
-    def fetch_and_parse(url):
+    def parse_naver_table(url):
         try:
             res = requests.get(url, headers=headers)
             res.raise_for_status()
-            # 인코딩 설정 (네이버는 euc-kr)
+            
+            # 테이블 읽기 (euc-kr)
             dfs = pd.read_html(res.text, encoding='euc-kr')
             
-            # [핵심] 표가 여러 개일 때 '종목명'이 있는 진짜 표를 찾음
-            target_df = pd.DataFrame()
-            for df in dfs:
-                # 컬럼에 종목명이 있거나, 데이터 중에 종목명이 포함된 경우
-                if '종목명' in df.columns or df.iloc[0].astype(str).str.contains('종목명').any():
-                    target_df = df
-                    break
+            # 네이버 페이지 구조상 2번째 테이블이 실제 랭킹 데이터임
+            if len(dfs) < 2: return pd.DataFrame()
+            df = dfs[1]
             
-            if target_df.empty and len(dfs) >= 2:
-                target_df = dfs[1] # 보통 2번째 표가 데이터임
+            # [중요] 데이터 정제 로직 (빈 줄 및 이상한 헤더 제거)
+            # 1. NaN이 많은 행 제거 (빈 줄)
+            df = df.dropna(thresh=3)
+            
+            # 2. 첫 번째 컬럼이 숫자인 행만 남기기 (순위가 있는 행만 데이터임)
+            # '순위' 컬럼이 숫자로 변환 가능한지 확인
+            df = df[pd.to_numeric(df.iloc[:, 0], errors='coerce').notnull()]
+            
+            # 3. 필요한 컬럼만 콕 집어서 가져오기 (위치 기반)
+            # 보통: [0:순위, 1:종목명, 2:현재가, 3:전일비, 4:등락률, 5:매수량, 6:매도량, 7:순매수량]
+            # 안전하게 종목명(1), 등락률(4), 순매수량(5 또는 7 - 보통 매수총합이 아니라 순매수량이 끝에 있음)
+            
+            # 네이버 구조: [순위, 종목명, 현재가, 전일비, 등락률, 순매수량] 형태가 많음
+            # iloc로 강제 지정
+            result = df.iloc[:, [1, 2, 4, 5]].copy()
+            result.columns = ['종목명', '현재가', '등락률', '수급량']
+            
+            # 4. 데이터 클렌징 (콤마, 퍼센트, 기호 제거)
+            result['종목명'] = result['종목명'].astype(str).str.strip()
+            
+            def clean_num(x):
+                if pd.isna(x): return 0
+                x = str(x).replace(',', '').replace('%', '').replace('+', '').strip()
+                try: return float(x)
+                except: return 0
                 
-            # 데이터 정제
-            target_df = target_df.dropna(how='all') # 빈 줄 제거
+            result['현재가'] = result['현재가'].apply(clean_num).astype(int)
+            result['등락률'] = result['등락률'].apply(clean_num)
+            result['수급량'] = result['수급량'].apply(clean_num).astype(int)
             
-            # 컬럼 이름이 꼬였을 경우 강제 매핑 (순매수량 기준)
-            if '순매수량' not in target_df.columns:
-                # 네이버 구조상 보통 1열: 순위, 2열: 종목명, ... 마지막: 순매수량
-                target_df = target_df.iloc[:, [1, 2, 3, -1]] # 종목명, 현재가, 등락률, 순매수량(추정)
-            else:
-                 target_df = target_df[['종목명', '현재가', '등락률', '순매수량']]
-                 
-            target_df.columns = ['종목명', '현재가', '등락률', '수급량']
-            target_df = target_df.dropna(subset=['종목명'])
+            return result.head(20) # 넉넉하게 20개 리턴
             
-            # 숫자형 변환 (콤마 제거)
-            target_df['수급량'] = target_df['수급량'].astype(str).str.replace(',', '', regex=True)
-            target_df['수급량'] = pd.to_numeric(target_df['수급량'], errors='coerce')
-            
-            return target_df
         except Exception as e:
             return pd.DataFrame()
 
-    df_f = fetch_and_parse(url_foreign)
-    df_i = fetch_and_parse(url_inst)
+    df_f = parse_naver_table(url_foreign)
+    df_i = parse_naver_table(url_inst)
     
-    # 합치기 (종목명 기준)
+    # 합치기 (쌍끌이)
+    merged = pd.DataFrame()
     if not df_f.empty and not df_i.empty:
-        merged = pd.merge(df_f[['종목명', '현재가', '등락률', '수급량']], df_i[['종목명', '수급량']], on='종목명', suffixes=('_F', '_I'))
+        merged = pd.merge(df_f, df_i[['종목명', '수급량']], on='종목명', suffixes=('_F', '_I'))
         merged.rename(columns={'수급량_F': '외국인', '수급량_I': '기관'}, inplace=True)
-        # 외국인 수량 기준 내림차순
-        merged = merged.sort_values(by='외국인', ascending=False)
-        return df_f, df_i, merged
-    else:
-        return df_f, df_i, pd.DataFrame()
+        # 외국인 수량 많은 순 정렬
+        merged = merged.sort_values('외국인', ascending=False)
+    
+    return df_f, df_i, merged
 
 # --- 3. 통합 스캐너 ---
 def run_all_scanners(code_list):
@@ -273,7 +276,7 @@ def analyze_deep(code, name):
     except: return None, 0, 0, 0
 
 # --- 메인 UI ---
-st.title(f"⚔️ 단타 전투 머신 (Final Engine)")
+st.title(f"⚔️ 단타 전투 머신 (Naver Pro)")
 st.caption(f"접속일: {display_date}")
 
 c1, c2, c3 = st.columns(3)
@@ -374,7 +377,7 @@ else:
     # [Tab 3] 수급 포착 (네이버 금융 연동)
     with tab3:
         st.markdown("### 🦁 네이버 금융 수급 랭킹")
-        st.caption("※ 네이버 금융에서 **실시간 상위 종목**을 긁어옵니다. (무조건 뜸)")
+        st.caption("※ 네이버 금융에서 **실시간 상위 종목**을 긁어옵니다.")
         
         if st.button("💰 수급 데이터 불러오기"):
             with st.spinner("네이버 금융 접속 중..."):
@@ -382,18 +385,32 @@ else:
                 
                 if not merged.empty:
                     st.success(f"🚀 **쌍끌이(외인+기관) 포착: {len(merged)}종목**")
-                    st.dataframe(merged, hide_index=True, use_container_width=True)
+                    st.dataframe(
+                        merged.style.format({'현재가': '{:,}', '외국인': '{:,}', '기관': '{:,}', '등락률': '{:.2f}%'})
+                        .map(color_surplus, subset=['등락률']),
+                        hide_index=True, use_container_width=True
+                    )
                 else:
                     st.info("쌍끌이 종목이 없거나 데이터를 가져오지 못했습니다.")
                 
                 c1, c2 = st.columns(2)
                 with c1:
                     st.markdown("**🦁 외국인 순매수 Top 10**")
-                    if not df_f.empty: st.dataframe(df_f[['종목명', '수급량']].head(10), hide_index=True)
+                    if not df_f.empty: 
+                        st.dataframe(
+                            df_f[['종목명', '등락률', '수급량']].head(10).style.format({'수급량': '{:,}', '등락률': '{:.2f}%'})
+                            .map(color_surplus, subset=['등락률']), 
+                            hide_index=True
+                        )
                     else: st.error("데이터 없음")
                 with c2:
                     st.markdown("**🐯 기관 순매수 Top 10**")
-                    if not df_i.empty: st.dataframe(df_i[['종목명', '수급량']].head(10), hide_index=True)
+                    if not df_i.empty: 
+                        st.dataframe(
+                            df_i[['종목명', '등락률', '수급량']].head(10).style.format({'수급량': '{:,}', '등락률': '{:.2f}%'})
+                            .map(color_surplus, subset=['등락률']), 
+                            hide_index=True
+                        )
                     else: st.error("데이터 없음")
 
     # [Tab 4] 정밀 분석
