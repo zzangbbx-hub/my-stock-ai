@@ -6,10 +6,10 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import concurrent.futures
 import os
-import time
+import requests
 
 # 페이지 설정
-st.set_page_config(page_title="단타 전투 머신 (Master)", layout="wide")
+st.set_page_config(page_title="단타 전투 머신 (Naver Engine)", layout="wide")
 
 # 윈도우 폰트 깨짐 방지
 if os.name == 'nt':
@@ -20,39 +20,32 @@ if os.name == 'nt':
 if 'my_trade_log' not in st.session_state:
     st.session_state.my_trade_log = []
 
-# --- 사이드바: 날짜 및 설정 ---
-st.sidebar.title("🛠️ 컨트롤 패널")
-
-# [핵심] 날짜 자동 계산 로직 (기본값 설정용)
+# --- 1. 날짜 및 기초 함수 ---
 kst_now = datetime.utcnow() + timedelta(hours=9)
-default_date = kst_now
-if kst_now.hour < 9: # 오전 9시 전이면 어제로
-    default_date = kst_now - timedelta(days=1)
-    if default_date.weekday() == 6: default_date -= timedelta(days=2) # 일 -> 금
-    elif default_date.weekday() == 5: default_date -= timedelta(days=1) # 토 -> 금
+today_str = kst_now.strftime("%Y%m%d")
+display_date = kst_now.strftime("%m월 %d일")
 
-# [핵심] 사용자가 날짜를 직접 선택 가능하게 변경
-selected_date = st.sidebar.date_input(
-    "📅 분석 기준일 선택",
-    value=default_date,
-    max_value=kst_now
-)
-target_date = selected_date.strftime("%Y%m%d")
-st.sidebar.caption(f"선택된 날짜: {target_date}")
-st.sidebar.info("💡 데이터가 안 나오면 날짜를 하루 전(평일)으로 바꿔보세요!")
-
-# --- 2. 데이터 수집 ---
+# --- 2. 데이터 수집 (시세) ---
 @st.cache_data(ttl=300)
-def get_market_data(date_str):
+def get_market_data():
+    # 시세는 가장 최신 평일 기준
+    target_date = today_str
+    
+    # 오전 9시 전이면 어제 날짜로 (주말 처리)
+    if kst_now.hour < 9:
+        d = kst_now - timedelta(days=1)
+        if d.weekday() == 6: d -= timedelta(days=2)
+        elif d.weekday() == 5: d -= timedelta(days=1)
+        target_date = d.strftime("%Y%m%d")
+
     with concurrent.futures.ThreadPoolExecutor() as executor:
-        f_k = executor.submit(stock.get_market_ohlcv_by_ticker, date_str, market="KOSPI")
-        f_q = executor.submit(stock.get_market_ohlcv_by_ticker, date_str, market="KOSDAQ")
+        f_k = executor.submit(stock.get_market_ohlcv_by_ticker, target_date, market="KOSPI")
+        f_q = executor.submit(stock.get_market_ohlcv_by_ticker, target_date, market="KOSDAQ")
         df_k = f_k.result()
         df_q = f_q.result()
         
     df = pd.concat([df_k, df_q])
-    # 데이터가 없으면 빈 껍데기 반환
-    if df.empty: return pd.DataFrame()
+    if df.empty: return pd.DataFrame() # 장 휴장 등 대비
     
     df = df.sort_values(by='거래대금', ascending=False).head(100)
     
@@ -81,22 +74,41 @@ def get_market_data(date_str):
 
     return df
 
+# --- [NEW] 네이버 금융 크롤링 (수급 해결사) ---
 @st.cache_data(ttl=600)
-def get_investor_data(date_str):
+def get_naver_supply():
+    # 네이버 금융 상위 거래원 크롤링 (차단 없음)
+    # 9000: 외국인, 1000: 기관
+    url_foreign = "https://finance.naver.com/sise/sise_deal_rank.naver?investor_gubun=9000&type=buy"
+    url_inst = "https://finance.naver.com/sise/sise_deal_rank.naver?investor_gubun=1000&type=buy"
+    
+    headers = {'User-Agent': 'Mozilla/5.0'}
+    
     try:
-        # [수정] 데이터 호출 방식 강화
-        df_kospi = stock.get_market_net_purchases_of_equities_by_ticker(date_str, "KOSPI")
-        df_kosdaq = stock.get_market_net_purchases_of_equities_by_ticker(date_str, "KOSDAQ")
+        # 외국인
+        res_f = requests.get(url_foreign, headers=headers)
+        dfs_f = pd.read_html(res_f.text, encoding='euc-kr')
+        # 테이블이 여러개인데 보통 3번째(종목 리스트)가 실제 데이터
+        df_f = dfs_f[0] if len(dfs_f) > 0 else pd.DataFrame()
+        # 데이터 정제 (NaN 제거)
+        df_f = df_f.dropna(subset=['종목명'])[['종목명', '현재가', '등락률', '순매수량']]
+        df_f.columns = ['종목명', '현재가', '등락률', '외국인']
         
-        if df_kospi.empty and df_kosdaq.empty:
-            return pd.DataFrame()
-            
-        df = pd.concat([df_kospi, df_kosdaq])
-        df = df[['종목명', '종가', '등락률', '외국인', '기관합계']]
-        return df.sort_values(by='외국인', ascending=False)
-    except: return pd.DataFrame()
+        # 기관
+        res_i = requests.get(url_inst, headers=headers)
+        dfs_i = pd.read_html(res_i.text, encoding='euc-kr')
+        df_i = dfs_i[0] if len(dfs_i) > 0 else pd.DataFrame()
+        df_i = df_i.dropna(subset=['종목명'])[['종목명', '순매수량']]
+        df_i.columns = ['종목명', '기관']
+        
+        # 합치기 (쌍끌이 찾기용)
+        merged = pd.merge(df_f, df_i, on='종목명', how='inner')
+        return df_f, df_i, merged
+        
+    except Exception as e:
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
 
-# --- 3. 통합 스캐너 (S/A/B 등급) ---
+# --- 3. 통합 스캐너 ---
 def run_all_scanners(code_list):
     results = []
     progress_bar = st.progress(0)
@@ -131,7 +143,6 @@ def run_all_scanners(code_list):
             tags = []
             score = 0
             
-            # 채점
             is_uptrend = curr['Close'] > ma60.iloc[-1]
             is_support = abs(curr['Close'] - ma20.iloc[-1]) / curr['Close'] < 0.03
             if is_uptrend and is_support:
@@ -162,12 +173,7 @@ def run_all_scanners(code_list):
                 score += 10
 
             if tags:
-                return {
-                    'code': code, 
-                    'tags': ", ".join(tags),
-                    'price': curr['Close'],
-                    'score': score
-                }
+                return {'code': code, 'tags': ", ".join(tags), 'price': curr['Close'], 'score': score}
             return None
         except: return None
         
@@ -238,16 +244,14 @@ def analyze_deep(code, name):
     except: return None, 0, 0, 0
 
 # --- 메인 UI ---
-# target_date는 사이드바에서 선택한 값 사용
-st.title(f"⚔️ 단타 전투 머신 (Master)")
-formatted_date = selected_date.strftime("%m월 %d일")
-st.caption(f"기준일: {formatted_date}")
+st.title(f"⚔️ 단타 전투 머신 (Naver Engine)")
+st.caption(f"접속일: {display_date} (네이버 금융 연동)")
 
 c1, c2, c3 = st.columns(3)
 indices = {"KOSPI": "KS11", "KOSDAQ": "KQ11", "나스닥": "NQ=F"}
 for i, (k, v) in enumerate(indices.items()):
     try:
-        d = fdr.DataReader(v).tail(5) # 넉넉하게 가져와서 확인
+        d = fdr.DataReader(v).tail(5)
         if len(d) >= 2:
             val = d['Close'].iloc[-1]
             diff = val - d['Close'].iloc[-2]
@@ -258,16 +262,13 @@ for i, (k, v) in enumerate(indices.items()):
 
 st.divider()
 
-# 데이터 로드
-all_df = get_market_data(target_date)
+all_df = get_market_data()
 
 if all_df.empty:
-    st.error(f"⚠️ {formatted_date} 데이터가 없습니다! (휴장일이거나 장 시작 전)")
-    st.info("👈 왼쪽 사이드바에서 날짜를 하루 전으로 바꿔보세요.")
+    st.error("⚠️ 시세 데이터를 불러오지 못했습니다. 잠시 후 새로고침 해주세요.")
 else:
-    # 탭 구성 (5개)
     tab1, tab2, tab3, tab4, tab5 = st.tabs([
-        "🏆 스나이퍼", "📡 통합 스캐너(등급)", "💰 수급 포착", "🔮 정밀 분석", "📝 매매 일지"
+        "🏆 스나이퍼", "📡 통합 스캐너(등급)", "💰 수급 포착(네이버)", "🔮 정밀 분석", "📝 매매 일지"
     ])
 
     def color_surplus(val):
@@ -315,10 +316,10 @@ else:
             hide_index=True, use_container_width=True
         )
 
-    # [Tab 2] 통합 스캐너 (S/A/B 등급)
+    # [Tab 2] 통합 스캐너
     with tab2:
-        st.markdown("### 📡 AI 패턴 정밀 스캔 (S/A/B 등급제)")
-        st.caption("※ 전문가 점수 기반으로 **S급 > A급 > B급** 순으로 보여줍니다.")
+        st.markdown("### 📡 AI 패턴 정밀 스캔")
+        st.caption("※ **S급(50점+) > A급(30점+) > B급** 순으로 보여줍니다.")
         
         if st.button("🚀 스캔 & 등급 판정"):
             scan_codes = all_df.index.tolist()
@@ -326,51 +327,45 @@ else:
             
             if results:
                 st.toast(f"🔔 {len(results)}개 포착! S급부터 보여줍니다.", icon="🥇")
-                
-                for i, res in enumerate(results):
+                for res in results:
                     name = all_df.loc[res['code']]['종목명']
                     price = res['price']
                     tags = res['tags']
                     score = res['score']
                     
-                    if score >= 50:
-                        st.markdown(f"### 🔴 S급 (강력 추천) - {name}")
-                    elif score >= 30:
-                        st.markdown(f"### 🟠 A급 (매수 우수) - {name}")
-                    else:
-                        st.markdown(f"### 🔵 B급 (관심 단계) - {name}")
+                    if score >= 50: st.markdown(f"### 🔴 S급 (강력 추천) - {name}")
+                    elif score >= 30: st.markdown(f"### 🟠 A급 (매수 우수) - {name}")
+                    else: st.markdown(f"### 🔵 B급 (관심 단계) - {name}")
                     
                     st.write(f"**가격:** {int(price):,}원 | **점수:** {score}점")
                     st.info(f"👉 **포착 사유:** {tags}")
                     st.divider()
             else: st.info("특이 패턴 종목이 없습니다.")
 
-    # [Tab 3] 수급 포착 (오류 해결됨)
+    # [Tab 3] 수급 포착 (네이버 금융 연동)
     with tab3:
-        st.markdown(f"### 🦁 큰손들이 사는 종목 ({formatted_date})")
+        st.markdown("### 🦁 네이버 금융 수급 랭킹")
+        st.caption("※ 네이버 금융에서 **실시간 상위 종목**을 긁어옵니다. (무조건 뜸)")
+        
         if st.button("💰 수급 데이터 불러오기"):
-            with st.spinner("분석 중..."):
-                inv_df = get_investor_data(target_date)
-                if not inv_df.empty:
-                    top_f = inv_df.sort_values('외국인', ascending=False).head(40)
-                    top_i = inv_df.sort_values('기관합계', ascending=False).head(40)
-                    both = pd.merge(top_f, top_i, on=['종목명'], suffixes=('_F', '_I'))
-                    
-                    if not both.empty:
-                        st.success(f"🚀 **쌍끌이(외인+기관) 포착: {len(both)}종목**")
-                        st.dataframe(both[['종목명', '등락률_F', '외국인', '기관합계']], hide_index=True)
-                    else:
-                        st.info("오늘 쌍끌이 매수 종목이 없습니다.")
-                        
-                    c1, c2 = st.columns(2)
-                    with c1:
-                        st.markdown("**🦁 외국인 순매수 Top**")
-                        st.dataframe(inv_df.sort_values('외국인', ascending=False).head(10)[['종목명','외국인']], hide_index=True)
-                    with c2:
-                        st.markdown("**🐯 기관 순매수 Top**")
-                        st.dataframe(inv_df.sort_values('기관합계', ascending=False).head(10)[['종목명','기관합계']], hide_index=True)
+            with st.spinner("네이버 금융 접속 중..."):
+                df_f, df_i, merged = get_naver_supply()
+                
+                if not merged.empty:
+                    st.success(f"🚀 **쌍끌이(외인+기관) 포착: {len(merged)}종목**")
+                    st.dataframe(merged, hide_index=True, use_container_width=True)
                 else:
-                    st.error(f"❌ {formatted_date} 수급 데이터가 없습니다. (휴장일 가능성)")
+                    st.info("쌍끌이 종목이 없거나 데이터를 가져오지 못했습니다.")
+                
+                c1, c2 = st.columns(2)
+                with c1:
+                    st.markdown("**🦁 외국인 순매수 Top 10**")
+                    if not df_f.empty: st.dataframe(df_f.head(10), hide_index=True)
+                    else: st.error("데이터 없음")
+                with c2:
+                    st.markdown("**🐯 기관 순매수 Top 10**")
+                    if not df_i.empty: st.dataframe(df_i.head(10), hide_index=True)
+                    else: st.error("데이터 없음")
 
     # [Tab 4] 정밀 분석
     with tab4:
