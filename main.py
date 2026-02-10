@@ -10,7 +10,7 @@ import requests
 import re
 
 # 페이지 설정
-st.set_page_config(page_title="단타 전투 머신 (Naver Pro)", layout="wide")
+st.set_page_config(page_title="단타 전투 머신 (Final Fix)", layout="wide")
 
 # 윈도우 폰트 깨짐 방지
 if os.name == 'nt':
@@ -72,46 +72,46 @@ def get_market_data():
 
     return df
 
-# --- [핵심 수정] 네이버 금융 정밀 크롤링 ---
+# --- [핵심 수정] 네이버 금융 '정밀 타격' 크롤링 ---
 @st.cache_data(ttl=600)
 def get_naver_supply():
+    # 9000: 외국인, 1000: 기관
     url_foreign = "https://finance.naver.com/sise/sise_deal_rank.naver?investor_gubun=9000&type=buy"
     url_inst = "https://finance.naver.com/sise/sise_deal_rank.naver?investor_gubun=1000&type=buy"
     
-    headers = {'User-Agent': 'Mozilla/5.0'}
+    # 더 강력한 헤더 (사람인 척)
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+        'Accept-Language': 'ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7'
+    }
     
     def parse_naver_table(url):
         try:
-            res = requests.get(url, headers=headers)
+            res = requests.get(url, headers=headers, timeout=5)
             res.raise_for_status()
             
-            # 테이블 읽기 (euc-kr)
-            dfs = pd.read_html(res.text, encoding='euc-kr')
+            # [핵심] class="type_2"인 테이블만 찾음 (이게 순위표임)
+            dfs = pd.read_html(res.text, encoding='euc-kr', attrs={"class": "type_2"})
             
-            # 네이버 페이지 구조상 2번째 테이블이 실제 랭킹 데이터임
-            if len(dfs) < 2: return pd.DataFrame()
-            df = dfs[1]
+            if not dfs: return pd.DataFrame()
+            df = dfs[0]
             
-            # [중요] 데이터 정제 로직 (빈 줄 및 이상한 헤더 제거)
-            # 1. NaN이 많은 행 제거 (빈 줄)
-            df = df.dropna(thresh=3)
+            # 데이터 정제 (빈 줄 제거)
+            df = df.dropna(how='all')
             
-            # 2. 첫 번째 컬럼이 숫자인 행만 남기기 (순위가 있는 행만 데이터임)
-            # '순위' 컬럼이 숫자로 변환 가능한지 확인
+            # '순위'가 숫자인 행만 남김 (헤더나 구분선 제거)
             df = df[pd.to_numeric(df.iloc[:, 0], errors='coerce').notnull()]
             
-            # 3. 필요한 컬럼만 콕 집어서 가져오기 (위치 기반)
-            # 보통: [0:순위, 1:종목명, 2:현재가, 3:전일비, 4:등락률, 5:매수량, 6:매도량, 7:순매수량]
-            # 안전하게 종목명(1), 등락률(4), 순매수량(5 또는 7 - 보통 매수총합이 아니라 순매수량이 끝에 있음)
-            
-            # 네이버 구조: [순위, 종목명, 현재가, 전일비, 등락률, 순매수량] 형태가 많음
-            # iloc로 강제 지정
-            result = df.iloc[:, [1, 2, 4, 5]].copy()
+            # 컬럼 매핑 (순위, 종목명, 현재가, 전일비, 등락률, 매수량, 매도량, 순매수량)
+            # 보통 1:종목명, 4:등락률, -1:순매수량
+            result = df.iloc[:, [1, 2, 4, -1]].copy()
             result.columns = ['종목명', '현재가', '등락률', '수급량']
             
-            # 4. 데이터 클렌징 (콤마, 퍼센트, 기호 제거)
+            # 글자 깨짐 및 공백 정리
             result['종목명'] = result['종목명'].astype(str).str.strip()
             
+            # 숫자 변환
             def clean_num(x):
                 if pd.isna(x): return 0
                 x = str(x).replace(',', '').replace('%', '').replace('+', '').strip()
@@ -122,20 +122,24 @@ def get_naver_supply():
             result['등락률'] = result['등락률'].apply(clean_num)
             result['수급량'] = result['수급량'].apply(clean_num).astype(int)
             
-            return result.head(20) # 넉넉하게 20개 리턴
+            return result.head(20)
             
         except Exception as e:
             return pd.DataFrame()
 
-    df_f = parse_naver_table(url_foreign)
-    df_i = parse_naver_table(url_inst)
+    # 병렬 호출로 속도 업
+    with concurrent.futures.ThreadPoolExecutor() as executor:
+        f_foreign = executor.submit(parse_naver_table, url_foreign)
+        f_inst = executor.submit(parse_naver_table, url_inst)
+        
+        df_f = f_foreign.result()
+        df_i = f_inst.result()
     
-    # 합치기 (쌍끌이)
+    # 합치기
     merged = pd.DataFrame()
     if not df_f.empty and not df_i.empty:
         merged = pd.merge(df_f, df_i[['종목명', '수급량']], on='종목명', suffixes=('_F', '_I'))
         merged.rename(columns={'수급량_F': '외국인', '수급량_I': '기관'}, inplace=True)
-        # 외국인 수량 많은 순 정렬
         merged = merged.sort_values('외국인', ascending=False)
     
     return df_f, df_i, merged
@@ -276,7 +280,7 @@ def analyze_deep(code, name):
     except: return None, 0, 0, 0
 
 # --- 메인 UI ---
-st.title(f"⚔️ 단타 전투 머신 (Naver Pro)")
+st.title(f"⚔️ 단타 전투 머신 (Final Fix)")
 st.caption(f"접속일: {display_date}")
 
 c1, c2, c3 = st.columns(3)
@@ -297,10 +301,10 @@ st.divider()
 all_df = get_market_data()
 
 if all_df.empty:
-    st.error("⚠️ 시세 데이터를 불러오지 못했습니다. 잠시 후 새로고침 해주세요.")
+    st.error("⚠️ 시세 데이터를 불러오지 못했습니다.")
 else:
     tab1, tab2, tab3, tab4, tab5 = st.tabs([
-        "🏆 스나이퍼", "📡 통합 스캐너(등급)", "💰 수급 포착(네이버)", "🔮 정밀 분석", "📝 매매 일지"
+        "🏆 스나이퍼", "📡 통합 스캐너", "💰 수급 포착", "🔮 정밀 분석", "📝 매매 일지"
     ])
 
     def color_surplus(val):
@@ -374,13 +378,13 @@ else:
                     st.divider()
             else: st.info("특이 패턴 종목이 없습니다.")
 
-    # [Tab 3] 수급 포착 (네이버 금융 연동)
+    # [Tab 3] 수급 포착
     with tab3:
         st.markdown("### 🦁 네이버 금융 수급 랭킹")
-        st.caption("※ 네이버 금융에서 **실시간 상위 종목**을 긁어옵니다.")
+        st.caption("※ 네이버 금융 데이터를 실시간으로 가져옵니다.")
         
         if st.button("💰 수급 데이터 불러오기"):
-            with st.spinner("네이버 금융 접속 중..."):
+            with st.spinner("네이버 금융 정밀 접속 중..."):
                 df_f, df_i, merged = get_naver_supply()
                 
                 if not merged.empty:
