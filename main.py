@@ -37,27 +37,32 @@ def get_date_str(date_str):
 # --- 2. 데이터 수집 (시세 + 수급) ---
 @st.cache_data(ttl=300)
 def get_market_data(date_str):
+    # 1. 시세 가져오기 (병렬)
     with concurrent.futures.ThreadPoolExecutor() as executor:
-        # 여기가 잘렸던 부분입니다. 다시 확인하세요!
         f_k = executor.submit(stock.get_market_ohlcv_by_ticker, date_str, market="KOSPI")
         f_q = executor.submit(stock.get_market_ohlcv_by_ticker, date_str, market="KOSDAQ")
-        
         df_k = f_k.result()
         df_q = f_q.result()
         
     df = pd.concat([df_k, df_q])
     df = df.sort_values(by='거래대금', ascending=False).head(50) # Top 50
     
+    # 2. [수정됨] 종목명 가져오기 (오류 수정)
     ticker_list = df.index.tolist()
     name_map = {}
+    
+    def fetch_name(t): 
+        return t, stock.get_market_ticker_name(t)
+
     with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
-        futures = {executor.submit(stock.get_market_ticker_name, t): t for t in ticker_list}
-        for future in concurrent.futures.as_completed(futures):
-            name_map[future.result()[0]] = future.result()[1]
+        results = executor.map(fetch_name, ticker_list)
+        for t, name in results:
+            name_map[t] = name
             
     df['종목명'] = df.index.map(name_map)
     df['거래대금(억)'] = (df['거래대금'] / 100000000).astype(int)
     
+    # 3. 지표 계산
     prev = df['종가'] / (1 + df['등락률']/100)
     df['시가갭'] = ((df['시가'] - prev) / prev * 100).round(2)
     pivot = (df['고가'] + df['저가'] + df['종가']) / 3
@@ -83,7 +88,6 @@ def get_investor_data(date_str):
 def run_scanners(code_list):
     results = []
     
-    # 로딩바 UI 요소 생성
     progress_bar = st.progress(0)
     status_text = st.empty()
     total = len(code_list)
@@ -124,7 +128,6 @@ def run_scanners(code_list):
             res = future.result()
             if res: results.append(res)
             
-            # 로딩바 업데이트
             if i % 2 == 0: 
                 prog = (i + 1) / total
                 progress_bar.progress(prog)
@@ -174,7 +177,6 @@ target_date = get_latest_business_day()
 st.title(f"⚡ 단타 전투 머신 (Final)")
 st.caption(f"기준: {get_date_str(target_date)}")
 
-# 상단 지수
 c1, c2, c3 = st.columns(3)
 indices = {"KOSPI": "KS11", "KOSDAQ": "KQ11", "나스닥": "NQ=F"}
 for i, (k, v) in enumerate(indices.items()):
@@ -195,7 +197,6 @@ all_df = get_market_data(target_date)
 # 탭 구성
 tab1, tab2, tab3, tab4 = st.tabs(["🏆 스나이퍼", "💰 수급 포착", "🔮 정밀 분석", "📡 AI 스캐너"])
 
-# 스타일링 함수
 def color_surplus(val):
     color = 'red' if val > 0 else 'blue' if val < 0 else 'black'
     return f'color: {color}'
@@ -224,7 +225,7 @@ with tab1:
         i4.metric("대금", f"{best['거래대금(억)']}억")
         
         st.divider()
-        st.caption("※ 거래대금 Top 50 리스트 (등락률 색상 적용)")
+        st.caption("※ 거래대금 Top 50 리스트")
         
         st.dataframe(
             all_df[['종목명', '종가', '등락률', '신호', '거래대금(억)']]
@@ -335,7 +336,7 @@ with tab3:
                     c2.success(f"익절: {int(curr*1.03):,}")
                     c3.error(f"손절: {int(curr*0.98):,}")
 
-# [Tab 4] AI 스캐너 (로딩바 추가)
+# [Tab 4] AI 스캐너
 with tab4:
     if not all_df.empty:
         st.subheader("📡 실시간 패턴 스캐너")
