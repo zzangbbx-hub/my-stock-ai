@@ -1,0 +1,10 @@
+streamlit
+finance-datareader
+pykrx
+pandas
+matplotlib
+plotly
+numpy
+requests
+lxml
+concurrent-futures
