@@ -10,7 +10,7 @@ import requests
 import re
 
 # 페이지 설정
-st.set_page_config(page_title="단타 전투 머신 (Final Pro)", layout="wide")
+st.set_page_config(page_title="단타 전투 머신 (Real-Time Pro)", layout="wide")
 
 # 윈도우 폰트 깨짐 방지
 if os.name == 'nt':
@@ -30,6 +30,7 @@ display_date = kst_now.strftime("%m월 %d일")
 @st.cache_data(ttl=300)
 def get_market_data():
     target_date = today_str
+    # 오전 9시 전이면 어제 날짜로 (시초가 갭 계산용)
     if kst_now.hour < 9:
         d = kst_now - timedelta(days=1)
         if d.weekday() == 6: d -= timedelta(days=2)
@@ -95,7 +96,8 @@ def get_naver_realtime_supply():
             
             # 컬럼 위치로 데이터 뽑기 (네이버 표 구조: 순위, 종목명, 현재가, 전일비, 등락률, 순매수량)
             # iloc[:, [1, 2, 4, 5]] -> 종목명, 현재가, 등락률, 순매수량
-            result = df.iloc[:, [1, 2, 4, 5]].copy()
+            # 만약 컬럼 순서가 다르면 5 대신 -1(마지막 컬럼)을 사용
+            result = df.iloc[:, [1, 2, 4, -1]].copy()
             result.columns = ['종목명', '현재가', '등락률', '수급량']
             
             # 데이터 클렌징 (글자, 쉼표, 기호 제거 후 숫자 변환)
@@ -372,8 +374,10 @@ else:
             with st.spinner("네이버 금융 정밀 접속 중..."):
                 df_f, df_i, merged = get_naver_realtime_supply()
                 
+                # 쌍끌이 (외국인+기관 모두 산 종목)
                 if not merged.empty:
                     st.success(f"🚀 **쌍끌이(외인+기관) 포착: {len(merged)}종목**")
+                    # 등락률, 외국인, 기관, 수급량(합계) 표시
                     st.dataframe(
                         merged[['종목명', '현재가', '등락률', '외국인', '기관']].style
                         .format({'현재가': '{:,}', '외국인': '{:,}', '기관': '{:,}', '등락률': '{:.2f}%'})
