@@ -9,7 +9,7 @@ import os
 import time
 
 # 페이지 설정
-st.set_page_config(page_title="단타 전투 머신 (Ranked)", layout="wide")
+st.set_page_config(page_title="단타 전투 머신 (S-Class)", layout="wide")
 
 # 윈도우 폰트 깨짐 방지
 if os.name == 'nt':
@@ -83,7 +83,7 @@ def get_investor_data(date_str):
         return df.sort_values(by='외국인', ascending=False)
     except: return pd.DataFrame()
 
-# --- 3. 통합 스캐너 (점수 매기기 기능 추가) ---
+# --- 3. 통합 스캐너 (점수 & 등급) ---
 def run_all_scanners(code_list):
     results = []
     progress_bar = st.progress(0)
@@ -99,7 +99,6 @@ def run_all_scanners(code_list):
             ma20 = c.rolling(20).mean()
             ma60 = c.rolling(60).mean()
             
-            # 볼린저밴드
             std = c.rolling(20).std()
             upper = ma20 + (std * 2)
             lower = ma20 - (std * 2)
@@ -108,11 +107,9 @@ def run_all_scanners(code_list):
             curr = df.iloc[-1]
             prev = df.iloc[-2]
             
-            # 거래량
             vol_avg = df['Volume'].rolling(5).mean().iloc[-1]
             vol_ratio = (curr['Volume'] / vol_avg) * 100 if vol_avg > 0 else 0
             
-            # RSI
             delta = c.diff()
             gain = (delta.where(delta > 0, 0)).rolling(14).mean()
             loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
@@ -120,39 +117,38 @@ def run_all_scanners(code_list):
             rsi = 100 - (100 / (1 + rs)).iloc[-1]
             
             tags = []
-            score = 0 # 전문가 점수
+            score = 0
             
-            # 1. 안전빵 (가장 높은 점수)
+            # [채점 기준]
+            # 1. 안전빵 (40점) - 킹갓제너럴 패턴
             is_uptrend = curr['Close'] > ma60.iloc[-1]
             is_support = abs(curr['Close'] - ma20.iloc[-1]) / curr['Close'] < 0.03
             if is_uptrend and is_support:
                 tags.append("🛡️안전빵")
                 score += 40
             
-            # 2. 양음양 (좋은 타이밍)
+            # 2. 양음양 (30점) - 확실한 눌림목
             if len(df) >= 3:
                 p2 = df.iloc[-3]
                 if p2['Close'] > p2['Open'] and prev['Close'] < prev['Open'] and curr['Close'] > curr['Open']:
                     tags.append("🕯️양음양")
                     score += 30
 
-            # 3. 거래폭발 (세력 개입)
+            # 3. 거래폭발 (20점) - 세력 개입
             if vol_ratio >= 200:
                 tags.append("💪거래폭발")
                 score += 20
                 
-            # 4. 용수철 (힘 응축)
+            # 4. 기타 보조지표 (10점씩)
             if band_w.iloc[-1] < 0.15:
                 tags.append("💥용수철")
                 score += 10
             
-            # 5. 갭상승 (공격적)
             gap = (curr['Open'] - prev['Close']) / prev['Close']
             if gap >= 0.03:
                 tags.append("🚀갭상승")
                 score += 10
 
-            # 6. 과낙폭 (기술적 반등)
             if rsi <= 30:
                 tags.append("📉과낙폭")
                 score += 10
@@ -162,7 +158,7 @@ def run_all_scanners(code_list):
                     'code': code, 
                     '特이사항': ", ".join(tags), 
                     'price': curr['Close'],
-                    'score': score # 점수 반환
+                    'score': score
                 }
             return None
         except: return None
@@ -175,12 +171,12 @@ def run_all_scanners(code_list):
             if i % 2 == 0:
                 prog = (i + 1) / total
                 progress_bar.progress(prog)
-                status_text.caption(f"⚡ AI 분석 및 채점 중... ({i+1}/{total})")
+                status_text.caption(f"⚡ AI 등급 심사 중... ({i+1}/{total})")
                 
     status_text.empty()
     progress_bar.empty()
     
-    # [핵심] 점수 높은 순으로 정렬
+    # 점수 높은 순 정렬
     results.sort(key=lambda x: x['score'], reverse=True)
     return results
 
@@ -237,7 +233,7 @@ def analyze_deep(code, name):
 
 # --- 메인 UI ---
 target_date = get_latest_business_day()
-st.title(f"⚔️ 단타 전투 머신 (Ranked)")
+st.title(f"⚔️ 단타 전투 머신 (S-Class)")
 st.caption(f"기준: {get_date_str(target_date)}")
 
 c1, c2, c3 = st.columns(3)
@@ -259,7 +255,7 @@ all_df = get_market_data(target_date)
 
 # 탭 구성 (5개)
 tab1, tab2, tab3, tab4, tab5 = st.tabs([
-    "🏆 스나이퍼", "📡 통합 스캐너(순위)", "💰 수급 포착", "🔮 정밀 분석", "📝 매매 일지"
+    "🏆 스나이퍼", "📡 통합 스캐너(등급)", "💰 수급 포착", "🔮 정밀 분석", "📝 매매 일지"
 ])
 
 def color_surplus(val):
@@ -308,39 +304,50 @@ with tab1:
             hide_index=True, use_container_width=True
         )
 
-# [Tab 2] 통합 스캐너 (순위 기능 적용)
+# [Tab 2] 통합 스캐너 (등급 적용)
 with tab2:
-    st.markdown("### 📡 AI 패턴 정밀 스캔 (랭킹 시스템)")
-    st.caption("※ **안전점수 높은 순서**대로 보여줍니다.")
+    st.markdown("### 📡 AI 패턴 정밀 스캔 (S/A/B 등급제)")
+    st.caption("※ 전문가 점수 기반으로 **S급 > A급 > B급** 순으로 보여줍니다.")
     
-    if st.button("🚀 스캔 & 순위 매기기"):
+    if st.button("🚀 스캔 & 등급 판정"):
         scan_codes = all_df.index.tolist()
         results = run_all_scanners(scan_codes)
         
         if results:
-            st.toast(f"🔔 {len(results)}개 포착! 1위부터 보여줍니다.", icon="🥇")
+            st.toast(f"🔔 {len(results)}개 포착! S급부터 보여줍니다.", icon="🥇")
             
             for i, res in enumerate(results):
                 name = all_df.loc[res['code']]['종목명']
                 price = res['price']
-                tags = res['特이사항'] # 키값 주의
+                tags = res['特이사항']
                 score = res['score']
                 
-                # 순위별 아이콘
-                if i == 0: rank_icon = "🥇 1위 (S급)"
-                elif i == 1: rank_icon = "🥈 2위 (S급)"
-                elif i == 2: rank_icon = "🥉 3위 (A급)"
-                else: rank_icon = f"{i+1}위"
+                # [NEW] 등급 판정 로직
+                grade_badge = ""
+                if score >= 50:
+                    grade_badge = "👑 [S급] 강력 추천"
+                    border_color = "red"
+                elif score >= 30:
+                    grade_badge = "🥇 [A급] 우수"
+                    border_color = "orange"
+                else:
+                    grade_badge = "🥈 [B급] 관심"
+                    border_color = "blue"
                 
                 with st.container():
-                    c1, c2 = st.columns([1, 4])
+                    c1, c2 = st.columns([1.5, 4])
                     with c1:
-                        st.info(f"**{rank_icon}**")
+                        if score >= 50: st.error(f"**{grade_badge}**") # 빨간색 강조
+                        elif score >= 30: st.warning(f"**{grade_badge}**") # 노란색
+                        else: st.info(f"**{grade_badge}**") # 파란색
+                        
+                        st.caption(f"점수: **{score}점**")
+                        
                     with c2:
                         st.write(f"**[{name}]** ({int(price):,}원)")
-                        st.caption(f"점수: **{score}점** | 패턴: {tags}")
+                        st.write(f"👉 {tags}")
                     
-                    if "안전빵" in tags: st.caption("└ 🛡️ **안전빵:** 60일선 위+20일선 지지 (강력 추천)")
+                    if "안전빵" in tags: st.caption("└ 🛡️ **안전빵:** 60일선 위+20일선 지지 (안정성 Top)")
                     st.divider()
         else: st.info("특이 패턴 종목이 없습니다.")
 
