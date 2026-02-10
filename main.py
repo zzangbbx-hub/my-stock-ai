@@ -391,3 +391,4 @@ with tab5:
             st.success("저장!")
     if st.session_state.my_trade_log:
         st.dataframe(pd.DataFrame(st.session_state.my_trade_log), use_container_width=True)
+
