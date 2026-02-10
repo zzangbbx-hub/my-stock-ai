@@ -6,10 +6,12 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import concurrent.futures
 import os
+import requests
+import re
 import time
 
 # 페이지 설정
-st.set_page_config(page_title="단타 전투 머신 (KRX Official)", layout="wide")
+st.set_page_config(page_title="단타 전투 머신 (Guerilla Mode)", layout="wide")
 
 # 윈도우 폰트 깨짐 방지
 if os.name == 'nt':
@@ -29,15 +31,11 @@ display_date = kst_now.strftime("%m월 %d일")
 @st.cache_data(ttl=300)
 def get_market_data():
     target_date = today_str
-    # 오전 9시 전이면 어제 날짜로 (시초가 갭 계산용)
     if kst_now.hour < 9:
-        target_date = (kst_now - timedelta(days=1)).strftime("%Y%m%d")
-
-    # 주말 보정 (토/일이면 금요일로)
-    dt_target = datetime.strptime(target_date, "%Y%m%d")
-    while dt_target.weekday() > 4: # 5:토, 6:일
-        dt_target -= timedelta(days=1)
-    target_date = dt_target.strftime("%Y%m%d")
+        d = kst_now - timedelta(days=1)
+        if d.weekday() == 6: d -= timedelta(days=2)
+        elif d.weekday() == 5: d -= timedelta(days=1)
+        target_date = d.strftime("%Y%m%d")
 
     with concurrent.futures.ThreadPoolExecutor() as executor:
         f_k = executor.submit(stock.get_market_ohlcv_by_ticker, target_date, market="KOSPI")
@@ -48,6 +46,7 @@ def get_market_data():
     df = pd.concat([df_k, df_q])
     if df.empty: return pd.DataFrame()
     
+    # 거래대금 상위 100개만 추림 (속도 최적화)
     df = df.sort_values(by='거래대금', ascending=False).head(100)
     
     ticker_list = df.index.tolist()
@@ -75,42 +74,62 @@ def get_market_data():
 
     return df
 
-# --- [핵심] KRX 공식 전산망 좀비 탐색기 ---
-# 네이버/다음이 막히면 KRX 원장을 뒤져서라도 찾아냄
-def get_krx_supply_zombie():
-    check_date = kst_now
+# --- [핵심] 게릴라 수급 탐색기 (개별 종목 침투) ---
+# 전체 순위 페이지가 막히니, 대장주들의 '개별 페이지'를 하나씩 찔러서 가져옴
+@st.cache_data(ttl=600)
+def get_guerilla_supply(target_codes):
     
-    # 오늘 포함 최근 5일(평일)을 역순으로 뒤짐
-    for i in range(5):
-        target_str = check_date.strftime("%Y%m%d")
-        
-        # 주말이면 패스
-        if check_date.weekday() > 4:
-            check_date -= timedelta(days=1)
-            continue
-            
+    supply_list = []
+    
+    # 네이버 모바일 페이지 (보안이 약함)
+    headers = {'User-Agent': 'Mozilla/5.0 (Linux; Android 10; K)'}
+    
+    def fetch_stock_supply(code, name):
+        url = f"https://m.finance.naver.com/item/frgn.naver?code={code}"
         try:
-            # KRX에서 '전체' 종목 수급 가져오기 (KOSPI + KOSDAQ)
-            # "ALL" 옵션은 가끔 에러나므로 안전하게 각각 호출
-            df_k = stock.get_market_net_purchases_of_equities_by_ticker(target_str, "KOSPI")
-            df_q = stock.get_market_net_purchases_of_equities_by_ticker(target_str, "KOSDAQ")
+            res = requests.get(url, headers=headers, timeout=3)
+            # 테이블 찾기
+            dfs = pd.read_html(res.text)
+            if not dfs: return None
             
-            # 데이터가 있으면 성공!
-            if not df_k.empty and not df_q.empty:
-                df = pd.concat([df_k, df_q])
-                # 필요한 컬럼만 정리
-                df = df[['종목명', '종가', '등락률', '외국인', '기관합계']]
-                df.columns = ['종목명', '현재가', '등락률', '외국인', '기관']
-                return df, target_str # 데이터와 날짜 반환
-                
+            # 첫 번째 테이블의 첫 번째 행 (가장 최근 날짜)
+            df = dfs[0]
+            latest = df.iloc[0] # 오늘 날짜 데이터
+            
+            # 데이터 추출 (날짜, 종가, 등락, 외국인, 기관)
+            # 네이버 모바일 구조: [날짜, 종가, 전일비, 등락률, 거래량, 기관, 외국인]
+            # 컬럼명이 바뀔 수 있으므로 위치로 접근하거나 이름 확인
+            
+            # 보통 '기관' '외국인' 글자가 포함된 컬럼을 찾음
+            inst_col = [c for c in df.columns if '기관' in c][0]
+            fore_col = [c for c in df.columns if '외국인' in c][0]
+            
+            inst_vol = int(str(latest[inst_col]).replace(',', ''))
+            fore_vol = int(str(latest[fore_col]).replace(',', ''))
+            
+            return {
+                '종목명': name,
+                '외국인': fore_vol,
+                '기관': inst_vol,
+                '합계': fore_vol + inst_vol
+            }
         except:
-            pass # 에러나면 하루 전으로
-            
-        # 실패하면 하루 전 날짜로 이동해서 다시 시도
-        check_date -= timedelta(days=1)
-        time.sleep(0.5) # KRX 서버 예의 지키기
+            return None
+
+    # 병렬 침투 시작 (속도 향상)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+        # code_list는 (code, name) 튜플 리스트여야 함
+        futures = [executor.submit(fetch_stock_supply, code, name) for code, name in target_codes]
         
-    return pd.DataFrame(), ""
+        for future in concurrent.futures.as_completed(futures):
+            res = future.result()
+            if res: supply_list.append(res)
+            
+    if not supply_list: return pd.DataFrame()
+    
+    df = pd.DataFrame(supply_list)
+    df = df.sort_values(by='합계', ascending=False) # 쌍끌이 순 정렬
+    return df
 
 # --- 3. 통합 스캐너 ---
 def run_all_scanners(code_list):
@@ -128,9 +147,7 @@ def run_all_scanners(code_list):
             ma20 = c.rolling(20).mean()
             ma60 = c.rolling(60).mean()
             std = c.rolling(20).std()
-            upper = ma20 + (std * 2)
-            lower = ma20 - (std * 2)
-            band_w = (upper - lower) / ma20
+            band_w = ((ma20 + (std*2)) - (ma20 - (std*2))) / ma20
             
             curr = df.iloc[-1]
             prev = df.iloc[-2]
@@ -239,7 +256,7 @@ def analyze_deep(code, name):
     except: return None, 0, 0, 0
 
 # --- 메인 UI ---
-st.title(f"⚔️ 단타 전투 머신 (KRX Official)")
+st.title(f"⚔️ 단타 전투 머신 (Guerilla Mode)")
 st.caption(f"접속일: {display_date}")
 
 c1, c2, c3 = st.columns(3)
@@ -263,7 +280,7 @@ if all_df.empty:
     st.error("⚠️ 시세 데이터를 불러오지 못했습니다. 잠시 후 새로고침 해주세요.")
 else:
     tab1, tab2, tab3, tab4, tab5 = st.tabs([
-        "🏆 스나이퍼", "📡 통합 스캐너(등급)", "💰 수급 포착(KRX)", "🔮 정밀 분석", "📝 매매 일지"
+        "🏆 스나이퍼", "📡 통합 스캐너(등급)", "💰 수급 포착(게릴라)", "🔮 정밀 분석", "📝 매매 일지"
     ])
 
     def color_surplus(val):
@@ -337,55 +354,36 @@ else:
                     st.divider()
             else: st.info("특이 패턴 종목이 없습니다.")
 
-    # [Tab 3] 수급 포착 (KRX 원장 조회)
+    # [Tab 3] 수급 포착 (게릴라 모드)
     with tab3:
-        st.markdown("### 🦁 메이저 수급 (KRX 공식)")
-        st.caption("※ 네이버 차단 시, **한국거래소(KRX)** 원장을 직접 뒤져서 데이터를 가져옵니다.")
+        st.markdown("### 🦁 대장주 수급 분석 (게릴라 침투)")
+        st.caption("※ 전체 랭킹이 차단되어, **오늘의 대장주 15개**를 개별적으로 정밀 타격하여 수급을 가져옵니다.")
         
-        if st.button("💰 KRX 원장 데이터 조회 (강력)"):
-            with st.spinner("KRX 서버 접속 중... (좀비 모드 가동)"):
-                df_supply, found_date = get_krx_supply_zombie()
+        if st.button("💰 대장주 수급 털어오기"):
+            # 대장주 15개 선정 (거래대금 순)
+            top_stocks = all_df.head(15)[['종목명']]
+            target_codes = [(code, row['종목명']) for code, row in top_stocks.iterrows()]
+            
+            with st.spinner(f"Top 15 종목 수급 정밀 분석 중..."):
+                guerilla_df = get_guerilla_supply(target_codes)
                 
-                if not df_supply.empty:
-                    # found_date 포맷팅
-                    d_str = datetime.strptime(found_date, "%Y%m%d").strftime("%m월 %d일")
-                    st.success(f"✅ **{d_str}** 기준 데이터 확보 성공!")
+                if not guerilla_df.empty:
+                    st.success(f"✅ **{len(guerilla_df)}개 종목** 수급 데이터 확보 성공!")
                     
-                    # 합계 계산 및 정렬 (쌍끌이)
-                    df_supply['합계'] = df_supply['외국인'] + df_supply['기관']
-                    merged = df_supply.sort_values(by='합계', ascending=False).head(30)
-                    
-                    st.markdown("#### 🚀 외국인+기관 동시 매수 (쌍끌이)")
                     st.dataframe(
-                        merged[['종목명', '현재가', '등락률', '외국인', '기관']].style
-                        .format({'현재가': '{:,}', '외국인': '{:,}', '기관': '{:,}', '등락률': '{:.2f}%'})
-                        .map(color_surplus, subset=['등락률']),
+                        guerilla_df[['종목명', '외국인', '기관', '합계']].style
+                        .format({'외국인': '{:,}', '기관': '{:,}', '합계': '{:,}'})
+                        .map(color_surplus, subset=['외국인', '기관', '합계']),
                         hide_index=True, use_container_width=True
                     )
                     
-                    st.divider()
-                    
-                    c1, c2 = st.columns(2)
-                    with c1:
-                        st.markdown("**🦁 외국인 순매수 Top 20**")
-                        top_f = df_supply.sort_values(by='외국인', ascending=False).head(20)
-                        st.dataframe(
-                            top_f[['종목명', '등락률', '외국인']].style
-                            .format({'외국인': '{:,}', '등락률': '{:.2f}%'})
-                            .map(color_surplus, subset=['등락률']), 
-                            hide_index=True
-                        )
-                    with c2:
-                        st.markdown("**🐯 기관 순매수 Top 20**")
-                        top_i = df_supply.sort_values(by='기관', ascending=False).head(20)
-                        st.dataframe(
-                            top_i[['종목명', '등락률', '기관']].style
-                            .format({'기관': '{:,}', '등락률': '{:.2f}%'})
-                            .map(color_surplus, subset=['등락률']), 
-                            hide_index=True
-                        )
+                    # 해석
+                    best_buy = guerilla_df.iloc[0]
+                    if best_buy['합계'] > 0:
+                        st.info(f"💡 오늘의 수급 왕: **[{best_buy['종목명']}]** (외인/기관 합계 +{best_buy['합계']:,}주)")
                 else:
-                    st.error("❌ KRX 서버에서도 데이터를 찾지 못했습니다. (서버 점검 중이거나 완전 차단)")
+                    st.error("❌ 모든 데이터 침투 실패. (IP 완전 차단됨)")
+                    st.warning("⚠️ 팁: 이 기능은 보안 정책상 '로컬 환경(내 컴퓨터)'에서 실행해야 가장 잘 작동합니다.")
 
     # [Tab 4] 정밀 분석
     with tab4:
