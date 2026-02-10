@@ -9,14 +9,14 @@ import os
 import time
 
 # 페이지 설정
-st.set_page_config(page_title="단타 전투 머신 (Grand Master)", layout="wide")
+st.set_page_config(page_title="단타 전투 머신 (Final Ver)", layout="wide")
 
 # 윈도우 폰트 깨짐 방지
 if os.name == 'nt':
     plt.rc('font', family='Malgun Gothic')
     plt.rcParams['axes.unicode_minus'] = False
 
-# 매매 일지 초기화 (변수명 충돌 방지)
+# 매매 일지 초기화
 if 'my_trade_log' not in st.session_state:
     st.session_state.my_trade_log = []
 
@@ -38,7 +38,7 @@ def get_date_str(date_str):
     days = ["월", "화", "수", "목", "금", "토", "일"]
     return d.strftime(f"%m월 %d일 ({days[d.weekday()]})")
 
-# --- 2. 데이터 수집 (병렬 처리) ---
+# --- 2. 데이터 수집 ---
 @st.cache_data(ttl=300)
 def get_market_data(date_str):
     with concurrent.futures.ThreadPoolExecutor() as executor:
@@ -48,7 +48,7 @@ def get_market_data(date_str):
         df_q = f_q.result()
         
     df = pd.concat([df_k, df_q])
-    # 상위 100개로 확장
+    # 100개 가져오기
     df = df.sort_values(by='거래대금', ascending=False).head(100)
     
     ticker_list = df.index.tolist()
@@ -205,7 +205,7 @@ def analyze_deep(code, name):
 
 # --- 메인 UI ---
 target_date = get_latest_business_day()
-st.title(f"⚔️ 단타 전투 머신 (Grand Master)")
+st.title(f"⚔️ 단타 전투 머신 (Final Ver)")
 st.caption(f"기준: {get_date_str(target_date)}")
 
 c1, c2, c3 = st.columns(3)
@@ -235,11 +235,12 @@ def color_surplus(val):
     color = 'red' if val > 0 else 'blue' if val < 0 else 'black'
     return f'color: {color}'
 
-# [Tab 1] 스나이퍼
+# [Tab 1] 스나이퍼 (정렬 기능 추가 + 100개 보기)
 with tab1:
     if not all_df.empty:
-        st.markdown("### 🔫 오늘의 대장주 (거래대금 상위)")
+        st.markdown("### 🔫 오늘의 대장주 (Captain Stock)")
         
+        # 대장주 로직 (거래대금 200억 이상 & 상승폭 큰 놈)
         t1 = all_df['거래대금(억)'] >= 200
         t2 = all_df['신호'].isin(["🔥돌파", "👀임박"])
         cand = all_df[t1 & t2].sort_values(by='등락률', ascending=False)
@@ -259,9 +260,23 @@ with tab1:
         i4.metric("대금", f"{best['거래대금(억)']}억")
         
         st.divider()
+        
+        # [NEW] 정렬 및 뷰 제어
+        c_sort, c_blank = st.columns([1, 4])
+        with c_sort:
+            sort_opt = st.radio("정렬 기준", ["거래대금순 (돈)", "등락률순 (힘)"], horizontal=True)
+            
         st.caption("※ 거래대금 Top 100 리스트")
+        
+        view_df = all_df.copy()
+        if sort_opt == "등락률순 (힘)":
+            view_df = view_df.sort_values(by='등락률', ascending=False)
+        else:
+            view_df = view_df.sort_values(by='거래대금(억)', ascending=False)
+            
+        # 100개 전부 표시 (head 제한 없음)
         st.dataframe(
-            all_df[['종목명', '종가', '등락률', '신호', '거래대금(억)']].head(20).style
+            view_df[['종목명', '종가', '등락률', '신호', '거래대금(억)']].style
             .format({'종가': '{:,}', '거래대금(억)': '{:,}', '등락률': '{:.2f}%'})
             .map(color_surplus, subset=['등락률']), 
             hide_index=True, use_container_width=True
@@ -358,10 +373,9 @@ with tab4:
                 c2.success(f"익절: {int(curr*1.03):,}")
                 c3.error(f"손절: {int(curr*0.98):,}")
 
-# [Tab 5] 매매 일지 (에러 수정됨)
+# [Tab 5] 매매 일지
 with tab5:
     st.markdown("### 📝 매매 복기장")
-    # 여기서 key를 'trade_form'으로 바꾸어서 충돌을 막았습니다.
     with st.form("trade_form"):
         c1, c2, c3 = st.columns(3)
         t_name = c1.text_input("종목명")
@@ -370,7 +384,6 @@ with tab5:
         memo = st.text_area("메모")
         if st.form_submit_button("기록"):
             p = (t_sell - t_buy)*100/t_buy if t_buy > 0 else 0
-            # 저장할 때는 my_trade_log에 저장
             st.session_state.my_trade_log.append({
                 "날짜": datetime.now().strftime("%Y-%m-%d"),
                 "종목": t_name, "수익률": f"{p:.2f}%", "메모": memo
