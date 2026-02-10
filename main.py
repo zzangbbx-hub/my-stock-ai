@@ -156,7 +156,7 @@ def run_all_scanners(code_list):
             if tags:
                 return {
                     'code': code, 
-                    '特이사항': ", ".join(tags), 
+                    'tags': ", ".join(tags), # 오타 수정 (특이사항 -> tags)
                     'price': curr['Close'],
                     'score': score
                 }
@@ -319,25 +319,23 @@ with tab2:
             for i, res in enumerate(results):
                 name = all_df.loc[res['code']]['종목명']
                 price = res['price']
-                tags = res['特이사항']
+                tags = res['tags'] # 오타 수정됨
                 score = res['score']
                 
                 # [NEW] 등급 판정 로직
                 grade_badge = ""
                 if score >= 50:
                     grade_badge = "👑 [S급] 강력 추천"
-                    border_color = "red"
                 elif score >= 30:
                     grade_badge = "🥇 [A급] 우수"
-                    border_color = "orange"
                 else:
                     grade_badge = "🥈 [B급] 관심"
-                    border_color = "blue"
                 
                 with st.container():
                     c1, c2 = st.columns([1.5, 4])
                     with c1:
-                        if score >= 50: st.error(f"**{grade_badge}**") # 빨간색 강조
+                        # 등급 배지 출력
+                        if score >= 50: st.error(f"**{grade_badge}**") # 빨간색
                         elif score >= 30: st.warning(f"**{grade_badge}**") # 노란색
                         else: st.info(f"**{grade_badge}**") # 파란색
                         
