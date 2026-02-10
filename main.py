@@ -156,7 +156,7 @@ def run_all_scanners(code_list):
             if tags:
                 return {
                     'code': code, 
-                    'tags': ", ".join(tags), # 오타 수정 (특이사항 -> tags)
+                    'tags': ", ".join(tags),
                     'price': curr['Close'],
                     'score': score
                 }
@@ -304,7 +304,7 @@ with tab1:
             hide_index=True, use_container_width=True
         )
 
-# [Tab 2] 통합 스캐너 (등급 적용)
+# [Tab 2] 통합 스캐너 (등급 글씨 크게)
 with tab2:
     st.markdown("### 📡 AI 패턴 정밀 스캔 (S/A/B 등급제)")
     st.caption("※ 전문가 점수 기반으로 **S급 > A급 > B급** 순으로 보여줍니다.")
@@ -319,33 +319,39 @@ with tab2:
             for i, res in enumerate(results):
                 name = all_df.loc[res['code']]['종목명']
                 price = res['price']
-                tags = res['tags'] # 오타 수정됨
+                tags = res['tags']
                 score = res['score']
                 
-                # [NEW] 등급 판정 로직
-                grade_badge = ""
+                # [NEW] 등급 표시 (텍스트로 크게)
+                grade_title = ""
+                grade_color = ""
+                
                 if score >= 50:
-                    grade_badge = "👑 [S급] 강력 추천"
+                    grade_title = "👑 S급"
+                    desc = "강력 추천"
+                    grade_color = "red"
                 elif score >= 30:
-                    grade_badge = "🥇 [A급] 우수"
+                    grade_title = "🥇 A급"
+                    desc = "매수 우수"
+                    grade_color = "orange"
                 else:
-                    grade_badge = "🥈 [B급] 관심"
+                    grade_title = "🥈 B급"
+                    desc = "관심 단계"
+                    grade_color = "blue"
                 
                 with st.container():
-                    c1, c2 = st.columns([1.5, 4])
-                    with c1:
-                        # 등급 배지 출력
-                        if score >= 50: st.error(f"**{grade_badge}**") # 빨간색
-                        elif score >= 30: st.warning(f"**{grade_badge}**") # 노란색
-                        else: st.info(f"**{grade_badge}**") # 파란색
-                        
-                        st.caption(f"점수: **{score}점**")
-                        
-                    with c2:
-                        st.write(f"**[{name}]** ({int(price):,}원)")
-                        st.write(f"👉 {tags}")
+                    c1, c2 = st.columns([1.2, 4])
                     
-                    if "안전빵" in tags: st.caption("└ 🛡️ **안전빵:** 60일선 위+20일선 지지 (안정성 Top)")
+                    # 왼쪽: 등급 (크게)
+                    with c1:
+                        st.markdown(f"### :{grade_color}[{grade_title}]")
+                        st.caption(f"**{desc}**\n({score}점)")
+                        
+                    # 오른쪽: 정보
+                    with c2:
+                        st.markdown(f"**[{name}]** `{int(price):,}원`")
+                        st.info(f"{tags}")
+                    
                     st.divider()
         else: st.info("특이 패턴 종목이 없습니다.")
 
