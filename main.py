@@ -6,11 +6,10 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import concurrent.futures
 import os
-import requests
-import json
+import time
 
 # 페이지 설정
-st.set_page_config(page_title="단타 전투 머신 (Hybrid)", layout="wide")
+st.set_page_config(page_title="단타 전투 머신 (KRX Official)", layout="wide")
 
 # 윈도우 폰트 깨짐 방지
 if os.name == 'nt':
@@ -30,11 +29,15 @@ display_date = kst_now.strftime("%m월 %d일")
 @st.cache_data(ttl=300)
 def get_market_data():
     target_date = today_str
+    # 오전 9시 전이면 어제 날짜로 (시초가 갭 계산용)
     if kst_now.hour < 9:
-        d = kst_now - timedelta(days=1)
-        if d.weekday() == 6: d -= timedelta(days=2)
-        elif d.weekday() == 5: d -= timedelta(days=1)
-        target_date = d.strftime("%Y%m%d")
+        target_date = (kst_now - timedelta(days=1)).strftime("%Y%m%d")
+
+    # 주말 보정 (토/일이면 금요일로)
+    dt_target = datetime.strptime(target_date, "%Y%m%d")
+    while dt_target.weekday() > 4: # 5:토, 6:일
+        dt_target -= timedelta(days=1)
+    target_date = dt_target.strftime("%Y%m%d")
 
     with concurrent.futures.ThreadPoolExecutor() as executor:
         f_k = executor.submit(stock.get_market_ohlcv_by_ticker, target_date, market="KOSPI")
@@ -72,83 +75,42 @@ def get_market_data():
 
     return df
 
-# --- [핵심] 하이브리드 수급 수집기 (네이버 실패시 다음 금융 가동) ---
-@st.cache_data(ttl=300)
-def get_realtime_supply_hybrid():
+# --- [핵심] KRX 공식 전산망 좀비 탐색기 ---
+# 네이버/다음이 막히면 KRX 원장을 뒤져서라도 찾아냄
+def get_krx_supply_zombie():
+    check_date = kst_now
     
-    # 1단계: 다음(Daum) 금융 API 시도 (JSON이라 가장 깔끔함)
-    # 다음은 헤더 체크가 심하므로 Referer를 정확히 줘야 함
-    def fetch_daum(market_code, type_code): # market: KOSPI/KOSDAQ, type: FOREIGN/INSTITUTION
-        url = "https://finance.daum.net/api/trend/investor/ranks"
-        headers = {
-            'User-Agent': 'Mozilla/5.0',
-            'Referer': 'https://finance.daum.net/domestic/investor_rank'
-        }
-        params = {
-            'limit': '30',
-            'market': market_code, # KOSPI or KOSDAQ
-            'type': type_code # FOREIGN_INVESTOR or INSTITUTION
-        }
+    # 오늘 포함 최근 5일(평일)을 역순으로 뒤짐
+    for i in range(5):
+        target_str = check_date.strftime("%Y%m%d")
+        
+        # 주말이면 패스
+        if check_date.weekday() > 4:
+            check_date -= timedelta(days=1)
+            continue
+            
         try:
-            res = requests.get(url, headers=headers, params=params, timeout=3)
-            data = res.json()
-            # 데이터 파싱
-            rank_data = data['data']
-            df = pd.DataFrame(rank_data)
-            if df.empty: return pd.DataFrame()
+            # KRX에서 '전체' 종목 수급 가져오기 (KOSPI + KOSDAQ)
+            # "ALL" 옵션은 가끔 에러나므로 안전하게 각각 호출
+            df_k = stock.get_market_net_purchases_of_equities_by_ticker(target_str, "KOSPI")
+            df_q = stock.get_market_net_purchases_of_equities_by_ticker(target_str, "KOSDAQ")
             
-            # 컬럼 매핑 (name, tradePrice(현재가), changeRate(등락률), netPureBuyTradePrice(순매수금액) or Volume)
-            # 다음은 보통 'netPureBuyTradeVolume'(순매수량)을 줌
-            df = df[['name', 'tradePrice', 'changeRate', 'netPureBuyTradeVolume']]
-            df.columns = ['종목명', '현재가', '등락률', '수급량']
-            
-            # 등락률 백분율 변환 (0.05 -> 5.0)
-            df['등락률'] = df['등락률'] * 100
-            
-            return df
+            # 데이터가 있으면 성공!
+            if not df_k.empty and not df_q.empty:
+                df = pd.concat([df_k, df_q])
+                # 필요한 컬럼만 정리
+                df = df[['종목명', '종가', '등락률', '외국인', '기관합계']]
+                df.columns = ['종목명', '현재가', '등락률', '외국인', '기관']
+                return df, target_str # 데이터와 날짜 반환
+                
         except:
-            return pd.DataFrame()
-
-    # 다음 API 호출 (코스피/코스닥 합치기)
-    with concurrent.futures.ThreadPoolExecutor() as executor:
-        # 외국인 (코스피+코스닥)
-        f_k_f = executor.submit(fetch_daum, 'KOSPI', 'FOREIGN_INVESTOR')
-        f_q_f = executor.submit(fetch_daum, 'KOSDAQ', 'FOREIGN_INVESTOR')
+            pass # 에러나면 하루 전으로
+            
+        # 실패하면 하루 전 날짜로 이동해서 다시 시도
+        check_date -= timedelta(days=1)
+        time.sleep(0.5) # KRX 서버 예의 지키기
         
-        # 기관 (코스피+코스닥)
-        f_k_i = executor.submit(fetch_daum, 'KOSPI', 'INSTITUTION')
-        f_q_i = executor.submit(fetch_daum, 'KOSDAQ', 'INSTITUTION')
-        
-        df_fk = f_k_f.result()
-        df_fq = f_q_f.result()
-        df_ik = f_k_i.result()
-        df_iq = f_q_i.result()
-        
-    # 데이터 합치기
-    df_f = pd.concat([df_fk, df_fq])
-    df_i = pd.concat([df_ik, df_iq])
-    
-    # 2단계: 다음이 실패했다면 네이버(Naver) 크롤링 시도 (Backup)
-    if df_f.empty and df_i.empty:
-        # 네이버 크롤링 로직 (이전 코드 재활용하되 더 단순하게)
-        # (생략 - 다음 API가 99% 성공하므로 코드 복잡도 줄임)
-        pass
-    
-    # 최종 데이터 정제
-    if not df_f.empty:
-        df_f = df_f.sort_values(by='수급량', ascending=False).head(20)
-    if not df_i.empty:
-        df_i = df_i.sort_values(by='수급량', ascending=False).head(20)
-        
-    # 쌍끌이 (교집합)
-    merged = pd.DataFrame()
-    if not df_f.empty and not df_i.empty:
-        merged = pd.merge(df_f, df_i[['종목명', '수급량']], on='종목명', suffixes=('_F', '_I'))
-        merged.rename(columns={'수급량_F': '외국인', '수급량_I': '기관'}, inplace=True)
-        merged['합계'] = merged['외국인'] + merged['기관']
-        merged = merged.sort_values(by='합계', ascending=False)
-        
-    return df_f, df_i, merged
+    return pd.DataFrame(), ""
 
 # --- 3. 통합 스캐너 ---
 def run_all_scanners(code_list):
@@ -277,7 +239,7 @@ def analyze_deep(code, name):
     except: return None, 0, 0, 0
 
 # --- 메인 UI ---
-st.title(f"⚔️ 단타 전투 머신 (Hybrid)")
+st.title(f"⚔️ 단타 전투 머신 (KRX Official)")
 st.caption(f"접속일: {display_date}")
 
 c1, c2, c3 = st.columns(3)
@@ -301,7 +263,7 @@ if all_df.empty:
     st.error("⚠️ 시세 데이터를 불러오지 못했습니다. 잠시 후 새로고침 해주세요.")
 else:
     tab1, tab2, tab3, tab4, tab5 = st.tabs([
-        "🏆 스나이퍼", "📡 통합 스캐너(등급)", "💰 수급 포착(하이브리드)", "🔮 정밀 분석", "📝 매매 일지"
+        "🏆 스나이퍼", "📡 통합 스캐너(등급)", "💰 수급 포착(KRX)", "🔮 정밀 분석", "📝 매매 일지"
     ])
 
     def color_surplus(val):
@@ -375,49 +337,55 @@ else:
                     st.divider()
             else: st.info("특이 패턴 종목이 없습니다.")
 
-    # [Tab 3] 수급 포착 (다음 금융 API 연동)
+    # [Tab 3] 수급 포착 (KRX 원장 조회)
     with tab3:
-        st.markdown("### 🦁 메이저 수급 (Daum Finance)")
-        st.caption("※ 네이버가 막히면 다음(Daum)에서 데이터를 가져옵니다. (강력함)")
+        st.markdown("### 🦁 메이저 수급 (KRX 공식)")
+        st.caption("※ 네이버 차단 시, **한국거래소(KRX)** 원장을 직접 뒤져서 데이터를 가져옵니다.")
         
-        if st.button("💰 수급 데이터 불러오기"):
-            with st.spinner("다음(Daum) 금융 서버 침투 중..."):
-                df_f, df_i, merged = get_realtime_supply_hybrid()
+        if st.button("💰 KRX 원장 데이터 조회 (강력)"):
+            with st.spinner("KRX 서버 접속 중... (좀비 모드 가동)"):
+                df_supply, found_date = get_krx_supply_zombie()
                 
-                if not merged.empty:
-                    st.success(f"🚀 **쌍끌이(외인+기관) 포착: {len(merged)}종목**")
+                if not df_supply.empty:
+                    # found_date 포맷팅
+                    d_str = datetime.strptime(found_date, "%Y%m%d").strftime("%m월 %d일")
+                    st.success(f"✅ **{d_str}** 기준 데이터 확보 성공!")
+                    
+                    # 합계 계산 및 정렬 (쌍끌이)
+                    df_supply['합계'] = df_supply['외국인'] + df_supply['기관']
+                    merged = df_supply.sort_values(by='합계', ascending=False).head(30)
+                    
+                    st.markdown("#### 🚀 외국인+기관 동시 매수 (쌍끌이)")
                     st.dataframe(
                         merged[['종목명', '현재가', '등락률', '외국인', '기관']].style
                         .format({'현재가': '{:,}', '외국인': '{:,}', '기관': '{:,}', '등락률': '{:.2f}%'})
                         .map(color_surplus, subset=['등락률']),
                         hide_index=True, use_container_width=True
                     )
+                    
+                    st.divider()
+                    
+                    c1, c2 = st.columns(2)
+                    with c1:
+                        st.markdown("**🦁 외국인 순매수 Top 20**")
+                        top_f = df_supply.sort_values(by='외국인', ascending=False).head(20)
+                        st.dataframe(
+                            top_f[['종목명', '등락률', '외국인']].style
+                            .format({'외국인': '{:,}', '등락률': '{:.2f}%'})
+                            .map(color_surplus, subset=['등락률']), 
+                            hide_index=True
+                        )
+                    with c2:
+                        st.markdown("**🐯 기관 순매수 Top 20**")
+                        top_i = df_supply.sort_values(by='기관', ascending=False).head(20)
+                        st.dataframe(
+                            top_i[['종목명', '등락률', '기관']].style
+                            .format({'기관': '{:,}', '등락률': '{:.2f}%'})
+                            .map(color_surplus, subset=['등락률']), 
+                            hide_index=True
+                        )
                 else:
-                    st.info("쌍끌이(동시 매수) 종목이 없거나 데이터를 가져오지 못했습니다.")
-                
-                st.divider()
-                
-                c1, c2 = st.columns(2)
-                with c1:
-                    st.markdown("**🦁 외국인 순매수 Top 10**")
-                    if not df_f.empty: 
-                        st.dataframe(
-                            df_f[['종목명', '등락률', '수급량']].head(10).style
-                            .format({'수급량': '{:,}', '등락률': '{:.2f}%'})
-                            .map(color_surplus, subset=['등락률']), 
-                            hide_index=True
-                        )
-                    else: st.error("데이터 없음 (서버 차단)")
-                with c2:
-                    st.markdown("**🐯 기관 순매수 Top 10**")
-                    if not df_i.empty: 
-                        st.dataframe(
-                            df_i[['종목명', '등락률', '수급량']].head(10).style
-                            .format({'수급량': '{:,}', '등락률': '{:.2f}%'})
-                            .map(color_surplus, subset=['등락률']), 
-                            hide_index=True
-                        )
-                    else: st.error("데이터 없음 (서버 차단)")
+                    st.error("❌ KRX 서버에서도 데이터를 찾지 못했습니다. (서버 점검 중이거나 완전 차단)")
 
     # [Tab 4] 정밀 분석
     with tab4:
