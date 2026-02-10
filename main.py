@@ -4,10 +4,16 @@ from pykrx import stock
 from datetime import datetime, timedelta
 import pandas as pd
 import matplotlib.pyplot as plt
-import concurrent.futures # 병렬 처리(속도 부스터)
+import concurrent.futures
+import os
 
-# 페이지 설정 (반드시 맨 위에)
-st.set_page_config(page_title="단타 전투 머신 (Turbo)", layout="wide")
+# 페이지 설정
+st.set_page_config(page_title="단타 전투 머신 (Ultra Fast)", layout="wide")
+
+# 윈도우 폰트 깨짐 방지
+if os.name == 'nt':
+    plt.rc('font', family='Malgun Gothic')
+    plt.rcParams['axes.unicode_minus'] = False
 
 # --- 1. 날짜 및 기초 함수 ---
 def get_latest_business_day():
@@ -27,32 +33,29 @@ def get_date_str(date_str):
     days = ["월", "화", "수", "목", "금", "토", "일"]
     return d.strftime(f"%m월 %d일 ({days[d.weekday()]})")
 
-# --- 2. 데이터 수집 (병렬 처리 적용) ---
-@st.cache_data(ttl=300) # 5분간 기억 (새로고침 안 해도 됨)
-def get_battle_data_fast(date_str, mkt):
+# --- 2. 데이터 수집 (캐싱 + 내부 병렬) ---
+@st.cache_data(ttl=300)
+def get_battle_data_single(date_str, mkt):
     try:
-        # 전체 시세 가져오기 (이건 한방에 됨)
+        # 전체 시세 가져오기
         df = stock.get_market_ohlcv_by_ticker(date_str, market=mkt)
         if df.empty: return pd.DataFrame(), 0, 0
         
         up_cnt = len(df[df['등락률'] > 0])
         down_cnt = len(df[df['등락률'] < 0])
         
-        # 거래대금 상위 40개만 추림
+        # 거래대금 상위 40개
         df = df.sort_values(by='거래대금', ascending=False).head(40)
         
-        # [속도 개선 핵심] 종목명 가져오기를 병렬로 처리
-        # 기존: 하나씩 요청 (느림) -> 변경: 10개가 동시에 요청 (빠름)
+        # 종목명 가져오기 (내부 병렬 처리)
         ticker_list = df.index.tolist()
         name_map = {}
         
-        def fetch_name(t):
-            return t, stock.get_market_ticker_name(t)
+        def fetch_name(t): return t, stock.get_market_ticker_name(t)
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
             results = executor.map(fetch_name, ticker_list)
-            for t, name in results:
-                name_map[t] = name
+            for t, name in results: name_map[t] = name
         
         df['종목명'] = df.index.map(name_map)
         df['거래대금(억)'] = (df['거래대금'] / 100000000).astype(int)
@@ -72,19 +75,19 @@ def get_battle_data_fast(date_str, mkt):
         return df, up_cnt, down_cnt
     except: return pd.DataFrame(), 0, 0
 
-# --- 3. AI 스캐너 (병렬 처리 적용) ---
-# [속도 개선] 스캐너도 동시에 5개씩 분석해서 속도 5배 향상
+# --- 3. AI 스캐너 ---
 def run_scanners_fast(code_list):
     results = []
     
-    # 분석 로직을 함수로 분리
     def analyze_one(code):
         try:
-            df = fdr.DataReader(code).tail(60)
-            if len(df) < 20: return None
+            df = fdr.DataReader(code).tail(120)
+            if len(df) < 60: return None
             
             c = df['Close']
             ma20 = c.rolling(20).mean()
+            ma60 = c.rolling(60).mean()
+            
             std = c.rolling(20).std()
             upper = ma20 + (std * 2)
             lower = ma20 - (std * 2)
@@ -104,33 +107,32 @@ def run_scanners_fast(code_list):
             # 2. 용수철
             if band_w.iloc[-1] < 0.15: tags.append("용수철")
                 
-            # 3. 거북이
-            if curr['Close'] > ma20.iloc[-1] and (curr['Close'] - ma20.iloc[-1])/curr['Close'] < 0.03:
-                tags.append("거북이")
-                
+            # 3. 안전빵
+            is_uptrend = curr['Close'] > ma60.iloc[-1]
+            is_support = abs(curr['Close'] - ma20.iloc[-1]) / curr['Close'] < 0.03
+            
+            if is_uptrend and is_support:
+                tags.append("안전빵")
+
             if tags:
-                return {'code': code, '특이사항': ", ".join(tags)}
+                return {'code': code, '특이사항': ", ".join(tags), 'price': curr['Close']}
             return None
         except: return None
 
-    # UI 진행바
     status_text = st.empty()
     progress_bar = st.progress(0)
     total = len(code_list)
     
-    # 병렬 실행 (일꾼 5명)
     with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
         futures = {executor.submit(analyze_one, code): code for code in code_list}
         
         for i, future in enumerate(concurrent.futures.as_completed(futures)):
             res = future.result()
             if res: results.append(res)
-            
-            # 진행률 업데이트 (너무 자주하면 느려지므로 5번마다)
             if i % 5 == 0:
                 progress = (i + 1) / total
                 progress_bar.progress(progress)
-                status_text.caption(f"⚡ 초고속 스캔 중... ({i+1}/{total})")
+                status_text.caption(f"⚡ 스캔 중... ({i+1}/{total})")
     
     status_text.empty()
     progress_bar.empty()
@@ -159,6 +161,7 @@ def analyze_deep(code, name):
         fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8), gridspec_kw={'height_ratios': [3, 1]})
         ax1.plot(df.index, df['Close'], label='Price', color='blue')
         ax1.plot(df.index, df['Close'].rolling(20).mean(), label='20MA', color='green', alpha=0.5)
+        ax1.plot(df.index, df['Close'].rolling(60).mean(), label='60MA', color='gray', alpha=0.3)
         ax1.axhline(fibo_618, color='orange', linestyle='--', label='Fibo 0.618')
         ax1.legend()
         ax1.grid(True, alpha=0.3)
@@ -176,11 +179,13 @@ def analyze_deep(code, name):
 
 # --- 메인 UI ---
 target_date = get_latest_business_day()
-st.title(f"⚡ 단타 전투 머신 (Turbo)")
-st.caption(f"전투일: {get_date_str(target_date)}")
+st.title(f"⚡ 단타 전투 머신 (Ultra Fast)")
+st.caption(f"기준: {get_date_str(target_date)}")
 
 c1, c2, c3 = st.columns(3)
 indices = {"KOSPI": "KS11", "KOSDAQ": "KQ11", "나스닥": "NQ=F"}
+
+# 지수 로딩도 병렬화 가능하지만, 워낙 빨라서 단순 처리
 for i, (k, v) in enumerate(indices.items()):
     try:
         d = fdr.DataReader(v).iloc[-2:]
@@ -193,17 +198,25 @@ for i, (k, v) in enumerate(indices.items()):
 
 st.divider()
 
-# 데이터 로드 (병렬 함수 호출)
-k_df, k_u, k_d = get_battle_data_fast(target_date, "KOSPI")
-q_df, q_u, q_d = get_battle_data_fast(target_date, "KOSDAQ")
+# [핵심] 코스피/코스닥 동시 로딩 (병렬 처리)
+# 기존에는 하나 끝나고 하나 시작했지만, 이제 둘 다 동시에 출발합니다.
+with concurrent.futures.ThreadPoolExecutor() as executor:
+    # 일꾼 2명에게 동시에 지시
+    future_k = executor.submit(get_battle_data_single, target_date, "KOSPI")
+    future_q = executor.submit(get_battle_data_single, target_date, "KOSDAQ")
+    
+    # 둘 다 끝날 때까지 기다렸다가 결과 받기
+    k_df, k_u, k_d = future_k.result()
+    q_df, q_u, q_d = future_q.result()
+
 all_df = pd.concat([k_df, q_df]) if not (k_df.empty and q_df.empty) else pd.DataFrame()
 
-tab1, tab2, tab3 = st.tabs(["🏆 랭킹 & 스나이퍼", "🔮 정밀 분석(판결)", "📡 AI 스캐너(설명)"])
+tab1, tab2, tab3 = st.tabs(["🏆 랭킹 & 스나이퍼", "🔮 정밀 분석(판결)", "📡 AI 스캐너(안전빵)"])
 
 # [Tab 1] 스나이퍼
 with tab1:
     if not all_df.empty:
-        st.markdown("### 🔫 AI 스나이퍼 (대장주)")
+        st.markdown("### 🔫 AI 스나이퍼 (돌파 매매)")
         
         t1 = all_df['거래대금(억)'] >= 200
         t2 = all_df['신호'].isin(["🔥돌파", "👀임박"])
@@ -237,7 +250,8 @@ with tab1:
         with ch: st.caption("※ 거래대금 Top 40")
         with cb:
             if st.button("🔄"):
-                get_battle_data_fast.clear() # 캐시 삭제
+                # 캐시 삭제 함수가 바뀌었으므로 새로 지정
+                get_battle_data_single.clear()
                 st.rerun()
                 
         cols = ['종목명', '종가', '등락률', '신호']
@@ -306,30 +320,30 @@ with tab2:
                     c2.success(m2)
                     c3.error(m3)
 
-# [Tab 3] AI 스캐너 (병렬 처리)
+# [Tab 3] AI 스캐너
 with tab3:
     if not all_df.empty:
         st.subheader("📡 실시간 패턴 스캐너")
-        st.caption("※ Top 40 종목을 5배 빠른 속도로 스캔합니다.")
+        st.caption("※ 안전하고 확실한 종목을 찾아냅니다.")
         
         if st.button("🚀 초고속 스캔 시작"):
             scan_codes = all_df.index.tolist()
-            results = run_scanners_fast(scan_codes) # 병렬 함수 사용
+            results = run_scanners_fast(scan_codes)
             
             if results:
                 st.success(f"총 {len(results)}개 종목 포착!")
+                
                 for res in results:
                     r_name = all_df.loc[res['code']]['종목명']
-                    r_price = all_df.loc[res['code']]['종가']
+                    r_price = res['price']
                     tags = res['특이사항']
                     
                     with st.container():
-                        st.write(f"**[{r_name}]** ({r_price:,}원)")
+                        st.write(f"**[{r_name}]** ({int(r_price):,}원)")
                         st.info(f"👉 {tags}")
-                        
+                        if "안전빵" in tags: st.caption("└ 🛡️ **안전빵:** 60일선 위 + 20일선 지지 (저위험)")
                         if "양음양" in tags: st.caption("└ 🕯️ **양음양:** N자 상승 (눌림목)")
-                        if "용수철" in tags: st.caption("└ 💥 **용수철:** 폭발 임박 (힘 모음)")
-                        if "거북이" in tags: st.caption("└ 🐢 **거북이:** 안전한 바닥 (20일선)")
+                        if "용수철" in tags: st.caption("└ 💥 **용수철:** 폭발 임박")
                         st.divider()
             else:
                 st.info("특이 패턴 종목이 없습니다.")
