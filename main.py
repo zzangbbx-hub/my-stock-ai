@@ -10,7 +10,7 @@ import requests
 import re
 
 # 페이지 설정
-st.set_page_config(page_title="단타 전투 머신 (News Commander)", layout="wide")
+st.set_page_config(page_title="단타 전투 머신 (Daum News)", layout="wide")
 
 # 윈도우 폰트 깨짐 방지
 if os.name == 'nt':
@@ -73,35 +73,41 @@ def get_market_data():
 
     return df
 
-# --- [NEW] 가장 강력한 도구: 실시간 뉴스 크롤러 ---
+# --- [핵심] 뉴스 엔진 교체 (Daum Finance API) ---
 @st.cache_data(ttl=300)
-def get_stock_news(code):
+def get_stock_news(stock_name):
+    # 다음 금융 뉴스 검색 API (JSON 반환이라 차단 안됨)
+    url = "https://finance.daum.net/api/search/news"
+    params = {
+        'q': stock_name,
+        'limit': 10  # 10개 가져오기
+    }
+    # 다음은 헤더(Referer) 검사가 필수
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'Referer': 'https://finance.daum.net/'
+    }
+    
     try:
-        # 네이버 금융 종목별 뉴스 리스트
-        url = f"https://finance.naver.com/item/news_news.naver?code={code}&page=1"
-        headers = {'User-Agent': 'Mozilla/5.0'}
-        res = requests.get(url, headers=headers)
+        res = requests.get(url, params=params, headers=headers, timeout=5)
+        data = res.json()
         
-        # 인코딩 설정
-        res.encoding = 'euc-kr'
-        
-        # 테이블 파싱
-        dfs = pd.read_html(res.text)
-        
-        # 뉴스 테이블 찾기
-        for df in dfs:
-            if '제목' in df.columns:
-                # 데이터 정제
-                df = df.dropna(subset=['제목'])
-                # 불필요한 연관기사 행 제거
-                df = df[~df['제목'].str.contains("연관기사")]
-                
-                # 상위 5개만 추출 (제목, 정보제공, 날짜)
-                result = df[['제목', '정보제공', '날짜']].head(5)
-                return result
-                
-        return pd.DataFrame()
-    except:
+        # 데이터가 'data' 키 안에 리스트로 들어있음
+        if 'data' in data and len(data['data']) > 0:
+            news_list = data['data']
+            df = pd.DataFrame(news_list)
+            
+            # 필요한 컬럼만 추출 (title, cpName(출처), date)
+            df = df[['title', 'cpName', 'date']]
+            df.columns = ['제목', '출처', '작성일']
+            
+            # 날짜 포맷 정리 (YYYY-MM-DD HH:MM:SS)
+            df['작성일'] = df['작성일'].astype(str).str[:16] 
+            
+            return df
+        else:
+            return pd.DataFrame()
+    except Exception as e:
         return pd.DataFrame()
 
 # --- 3. 정밀 진단 로직 ---
@@ -225,7 +231,7 @@ def scan_all_candidates(code_name_list):
     return results
 
 # --- 메인 UI ---
-st.title(f"⚔️ 단타 전투 머신 (News Commander)")
+st.title(f"⚔️ 단타 전투 머신 (Daum News Engine)")
 st.caption(f"기준: {display_date}")
 
 c1, c2, c3 = st.columns(3)
@@ -290,7 +296,7 @@ else:
             st.info("정밀 분석 탭의 '전수 조사' 기능을 이용하시면 더 강력합니다!")
 
     with tab3:
-        st.markdown("### 🩺 AI 주치의 + 📰 재료 탐지기")
+        st.markdown("### 🩺 AI 주치의 + 📰 Daum 뉴스")
         
         with st.expander("🚀 전체 스캔 & 유망주 발굴 (Click)", expanded=True):
             if st.button("🔥 Top 150 전수 조사 시작", type="primary"):
@@ -329,9 +335,9 @@ else:
                 with st.spinner("1단계: 차트 정밀 진단 중..."):
                     fig, score, reasons, curr_price = analyze_deep_pro(code, name)
                 
-                # 2. 뉴스 크롤링
-                with st.spinner("2단계: 최신 뉴스(재료) 털어오는 중..."):
-                    news_df = get_stock_news(code)
+                # 2. 뉴스 검색 (Daum Engine)
+                with st.spinner(f"2단계: 다음(Daum)에서 '{name}' 뉴스 수집 중..."):
+                    news_df = get_stock_news(name)
                 
                 if fig:
                     c1, c2 = st.columns([2, 3])
@@ -342,10 +348,10 @@ else:
                         st.error(f"손절가: {int(curr_price*0.97):,}원")
                         
                         st.markdown("---")
-                        st.markdown("#### 📰 최신 뉴스 (재료 확인)")
+                        st.markdown("#### 📰 최신 뉴스 (Daum)")
                         if not news_df.empty:
                             st.dataframe(news_df, hide_index=True, use_container_width=True)
-                            st.caption("※ 제목을 보고 호재인지 판단하세요.")
+                            st.caption("※ 제목을 클릭해서 볼 순 없지만, 호재 여부는 제목으로 판단 가능합니다.")
                         else:
                             st.info("최신 뉴스가 없거나 가져오지 못했습니다.")
                             
