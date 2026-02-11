@@ -6,10 +6,11 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import concurrent.futures
 import os
-import numpy as np
+import requests
+import re
 
 # 페이지 설정
-st.set_page_config(page_title="단타 전투 머신 (AI Scanner)", layout="wide")
+st.set_page_config(page_title="단타 전투 머신 (News Commander)", layout="wide")
 
 # 윈도우 폰트 깨짐 방지
 if os.name == 'nt':
@@ -44,7 +45,7 @@ def get_market_data():
     df = pd.concat([df_k, df_q])
     if df.empty: return pd.DataFrame()
     
-    # 거래대금 상위 150개 (분석 대상)
+    # 거래대금 상위 150개
     df = df.sort_values(by='거래대금', ascending=False).head(150)
     
     ticker_list = df.index.tolist()
@@ -72,7 +73,38 @@ def get_market_data():
 
     return df
 
-# --- 3. 정밀 진단 로직 (공통 함수) ---
+# --- [NEW] 가장 강력한 도구: 실시간 뉴스 크롤러 ---
+@st.cache_data(ttl=300)
+def get_stock_news(code):
+    try:
+        # 네이버 금융 종목별 뉴스 리스트
+        url = f"https://finance.naver.com/item/news_news.naver?code={code}&page=1"
+        headers = {'User-Agent': 'Mozilla/5.0'}
+        res = requests.get(url, headers=headers)
+        
+        # 인코딩 설정
+        res.encoding = 'euc-kr'
+        
+        # 테이블 파싱
+        dfs = pd.read_html(res.text)
+        
+        # 뉴스 테이블 찾기
+        for df in dfs:
+            if '제목' in df.columns:
+                # 데이터 정제
+                df = df.dropna(subset=['제목'])
+                # 불필요한 연관기사 행 제거
+                df = df[~df['제목'].str.contains("연관기사")]
+                
+                # 상위 5개만 추출 (제목, 정보제공, 날짜)
+                result = df[['제목', '정보제공', '날짜']].head(5)
+                return result
+                
+        return pd.DataFrame()
+    except:
+        return pd.DataFrame()
+
+# --- 3. 정밀 진단 로직 ---
 def calculate_score(df):
     if len(df) < 60: return 0, [], 0, 0, 0
     
@@ -80,19 +112,15 @@ def calculate_score(df):
     ma5 = c.rolling(5).mean()
     ma20 = c.rolling(20).mean()
     ma60 = c.rolling(60).mean()
-    
-    # 볼린저밴드
     std = c.rolling(20).std()
     bandwidth = ((ma20 + (std * 2)) - (ma20 - (std * 2))) / ma20
     
-    # RSI
     delta = c.diff()
     gain = (delta.where(delta > 0, 0)).rolling(14).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
     rs = gain / loss
     rsi = 100 - (100 / (1 + rs))
     
-    # MACD
     exp12 = c.ewm(span=12, adjust=False).mean()
     exp26 = c.ewm(span=26, adjust=False).mean()
     macd = exp12 - exp26
@@ -106,47 +134,23 @@ def calculate_score(df):
     score = 0
     reasons = []
     
-    # 1. 추세 (40점)
-    if curr_price > ma20.iloc[-1]:
-        score += 20
-        reasons.append("20일선 위")
-    if curr_price > ma60.iloc[-1]:
-        score += 10
-        reasons.append("60일선 위")
-    if ma5.iloc[-1] > ma20.iloc[-1]:
-        score += 10
-        reasons.append("골든크로스")
-        
-    # 2. 보조지표 (30점)
-    if 40 <= curr_rsi <= 70:
-        score += 10
-        reasons.append("RSI안정")
-    elif curr_rsi < 30:
-        score += 20
-        reasons.append("RSI과매도")
-        
-    if macd.iloc[-1] > signal.iloc[-1]:
-        score += 10
-        reasons.append("MACD매수")
-        
-    # 3. 거래량/패턴 (30점)
-    if avg_vol > 0 and curr_vol > avg_vol * 1.5:
-        score += 20
-        reasons.append("거래량폭발")
-    
-    if bandwidth.iloc[-1] < 0.15:
-        score += 10
-        reasons.append("밴드수축")
+    if curr_price > ma20.iloc[-1]: score += 20; reasons.append("20일선 위")
+    if curr_price > ma60.iloc[-1]: score += 10; reasons.append("60일선 위")
+    if ma5.iloc[-1] > ma20.iloc[-1]: score += 10; reasons.append("골든크로스")
+    if 40 <= curr_rsi <= 70: score += 10; reasons.append("RSI안정")
+    elif curr_rsi < 30: score += 20; reasons.append("RSI과매도")
+    if macd.iloc[-1] > signal.iloc[-1]: score += 10; reasons.append("MACD매수")
+    if avg_vol > 0 and curr_vol > avg_vol * 1.5: score += 20; reasons.append("거래량폭발")
+    if bandwidth.iloc[-1] < 0.15: score += 10; reasons.append("밴드수축")
         
     return score, reasons, curr_price, curr_rsi, curr_vol
 
-# --- 4. 정밀 분석 (단건 - 차트 포함) ---
+# --- 4. 정밀 분석 (차트 포함) ---
 def analyze_deep_pro(code, name):
     try:
         df = fdr.DataReader(code).tail(240)
         score, reasons, curr_price, curr_rsi, curr_vol = calculate_score(df)
         
-        # 차트 그리기
         c = df['Close']
         ma20 = c.rolling(20).mean()
         ma60 = c.rolling(60).mean()
@@ -166,7 +170,6 @@ def analyze_deep_pro(code, name):
         ax1.grid(True, alpha=0.2)
         
         ax2 = fig.add_subplot(gs[1])
-        # RSI 재계산 (plot용)
         delta = c.diff()
         gain = (delta.where(delta > 0, 0)).rolling(14).mean()
         loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
@@ -183,7 +186,7 @@ def analyze_deep_pro(code, name):
         return fig, score, reasons, curr_price
     except: return None, 0, [], 0
 
-# --- 5. 전수 조사 (Bulk Scan) ---
+# --- 5. 전수 조사 ---
 def scan_all_candidates(code_name_list):
     results = []
     progress_bar = st.progress(0)
@@ -195,7 +198,7 @@ def scan_all_candidates(code_name_list):
         try:
             df = fdr.DataReader(code).tail(120)
             score, reasons, price, rsi, vol = calculate_score(df)
-            if score >= 50: # 50점 이상만 리턴
+            if score >= 50:
                 return {
                     '종목명': name,
                     '현재가': price,
@@ -206,15 +209,11 @@ def scan_all_candidates(code_name_list):
         except: pass
         return None
 
-    # 병렬 처리 (속도 업)
     with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
         futures = {executor.submit(process_one, item): item for item in code_name_list}
-        
         for i, future in enumerate(concurrent.futures.as_completed(futures)):
             res = future.result()
             if res: results.append(res)
-            
-            # 진행률 표시
             if i % 5 == 0:
                 prog = (i + 1) / total
                 progress_bar.progress(prog)
@@ -222,13 +221,11 @@ def scan_all_candidates(code_name_list):
                 
     progress_bar.empty()
     status_text.empty()
-    
-    # 점수순 정렬
     results.sort(key=lambda x: x['점수'], reverse=True)
     return results
 
 # --- 메인 UI ---
-st.title(f"⚔️ 단타 전투 머신 (AI Scanner)")
+st.title(f"⚔️ 단타 전투 머신 (News Commander)")
 st.caption(f"기준: {display_date}")
 
 c1, c2, c3 = st.columns(3)
@@ -251,9 +248,8 @@ all_df = get_market_data()
 if all_df.empty:
     st.error("⚠️ 데이터 로드 실패. 잠시 후 다시 시도하세요.")
 else:
-    # 탭 구성
     tab1, tab2, tab3, tab4 = st.tabs([
-        "🏆 스나이퍼", "📡 통합 스캐너", "🩺 정밀 분석(전수조사)", "📝 매매 일지"
+        "🏆 스나이퍼", "📡 통합 스캐너", "🩺 정밀 분석+뉴스", "📝 매매 일지"
     ])
 
     def color_surplus(val):
@@ -261,7 +257,6 @@ else:
         color = 'red' if val > 0 else 'blue' if val < 0 else 'black'
         return f'color: {color}'
 
-    # [Tab 1] 스나이퍼
     with tab1:
         st.markdown("### 🔫 오늘의 대장주")
         t1 = all_df['거래대금(억)'] >= 200
@@ -289,59 +284,39 @@ else:
             hide_index=True, use_container_width=True
         )
 
-    # [Tab 2] 통합 스캐너 (기존과 동일)
     with tab2:
         st.markdown("### 📡 AI 패턴 정밀 스캔")
         if st.button("🚀 스캔 시작"):
-            scan_codes = all_df.index.tolist()
-            # 통합 스캐너는 analyze_one 사용 (기존 로직 유지)
-            # 여기서는 코드 생략하거나 analyze_one 로직 넣으면 됨
-            # 편의상 생략하지 않고 간단히 구현
             st.info("정밀 분석 탭의 '전수 조사' 기능을 이용하시면 더 강력합니다!")
 
-    # [Tab 3] 정밀 분석 (기능 대폭 강화)
     with tab3:
-        st.markdown("### 🩺 AI 주치의 정밀 진단")
+        st.markdown("### 🩺 AI 주치의 + 📰 재료 탐지기")
         
-        # 1. 전수 조사 섹션
         with st.expander("🚀 전체 스캔 & 유망주 발굴 (Click)", expanded=True):
-            st.caption("※ 거래대금 상위 150개 종목을 AI가 정밀 타격하여 점수를 매깁니다.")
-            
             if st.button("🔥 Top 150 전수 조사 시작", type="primary"):
-                # (코드, 종목명) 리스트 생성
                 target_list = list(zip(all_df.index, all_df['종목명']))
-                
-                with st.spinner("AI가 150개 차트를 모두 분석 중입니다... (약 10~20초 소요)"):
+                with st.spinner("AI가 150개 차트를 모두 분석 중입니다..."):
                     scan_results = scan_all_candidates(target_list)
                     
                 if scan_results:
                     st.success(f"✅ 분석 완료! 유망 종목 {len(scan_results)}개를 발견했습니다.")
-                    
-                    # 결과 데이터프레임
                     res_df = pd.DataFrame(scan_results)
-                    
-                    # S급, A급, B급 개수 카운트
                     s_cnt = len(res_df[res_df['점수'] >= 80])
                     a_cnt = len(res_df[(res_df['점수'] >= 60) & (res_df['점수'] < 80)])
-                    
                     c1, c2 = st.columns(2)
                     c1.metric("👑 S급 (강력 매수)", f"{s_cnt}개")
                     c2.metric("🥇 A급 (매수 고려)", f"{a_cnt}개")
-                    
-                    st.markdown("#### 🏆 AI 추천 랭킹")
                     st.dataframe(
                         res_df[['등급', '점수', '종목명', '현재가', '사유']].style
                         .format({'현재가': '{:,}', '점수': '{:.0f}'})
                         .map(lambda x: 'color: red; font-weight: bold' if x == 'S급' else 'color: orange' if x == 'A급' else 'color: blue', subset=['등급']),
                         hide_index=True, use_container_width=True
                     )
-                else:
-                    st.warning("조건에 맞는 종목을 찾지 못했습니다.")
+                else: st.warning("조건에 맞는 종목을 찾지 못했습니다.")
 
         st.divider()
 
-        # 2. 개별 진단 섹션
-        st.markdown("#### 🔍 개별 종목 상세 진단")
+        st.markdown("#### 🔍 개별 종목 상세 진단 (차트 + 뉴스)")
         opts = ["선택"] + [f"{r['종목명']} ({r['종가']:,})" for i, r in all_df.head(150).iterrows()]
         sel = st.selectbox("진단할 종목 선택", opts)
         
@@ -349,21 +324,34 @@ else:
             name = sel.split(' (')[0]
             code = all_df[all_df['종목명'] == name].index[0]
             
-            if st.button(f"'{name}' 차트 뜯어보기"):
-                with st.spinner("차트 분석 중..."):
+            if st.button(f"'{name}' 분석 및 뉴스 탐색"):
+                # 1. 차트 분석
+                with st.spinner("1단계: 차트 정밀 진단 중..."):
                     fig, score, reasons, curr_price = analyze_deep_pro(code, name)
-                    if fig:
-                        c1, c2 = st.columns([2, 3])
-                        with c1:
-                            st.markdown(f"### 점수: **{score}점**")
-                            for r in reasons: st.write(f"- {r}")
+                
+                # 2. 뉴스 크롤링
+                with st.spinner("2단계: 최신 뉴스(재료) 털어오는 중..."):
+                    news_df = get_stock_news(code)
+                
+                if fig:
+                    c1, c2 = st.columns([2, 3])
+                    with c1:
+                        st.markdown(f"### 점수: **{score}점**")
+                        for r in reasons: st.write(f"- {r}")
+                        st.success(f"목표가: {int(curr_price*1.05):,}원")
+                        st.error(f"손절가: {int(curr_price*0.97):,}원")
+                        
+                        st.markdown("---")
+                        st.markdown("#### 📰 최신 뉴스 (재료 확인)")
+                        if not news_df.empty:
+                            st.dataframe(news_df, hide_index=True, use_container_width=True)
+                            st.caption("※ 제목을 보고 호재인지 판단하세요.")
+                        else:
+                            st.info("최신 뉴스가 없거나 가져오지 못했습니다.")
                             
-                            st.success(f"목표가: {int(curr_price*1.05):,}원")
-                            st.error(f"손절가: {int(curr_price*0.97):,}원")
-                        with c2:
-                            st.pyplot(fig)
+                    with c2:
+                        st.pyplot(fig)
 
-    # [Tab 4] 매매 일지
     with tab4:
         st.markdown("### 📝 매매 복기장")
         with st.form("trade_form"):
