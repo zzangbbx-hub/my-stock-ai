@@ -6,12 +6,10 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import concurrent.futures
 import os
-import requests
-import re
-import time
+import numpy as np
 
 # 페이지 설정
-st.set_page_config(page_title="단타 전투 머신 (Guerilla Mode)", layout="wide")
+st.set_page_config(page_title="단타 전투 머신 (Chart Master)", layout="wide")
 
 # 윈도우 폰트 깨짐 방지
 if os.name == 'nt':
@@ -31,6 +29,7 @@ display_date = kst_now.strftime("%m월 %d일")
 @st.cache_data(ttl=300)
 def get_market_data():
     target_date = today_str
+    # 장 시작 전(09시)이면 어제 날짜 기준
     if kst_now.hour < 9:
         d = kst_now - timedelta(days=1)
         if d.weekday() == 6: d -= timedelta(days=2)
@@ -46,8 +45,8 @@ def get_market_data():
     df = pd.concat([df_k, df_q])
     if df.empty: return pd.DataFrame()
     
-    # 거래대금 상위 100개만 추림 (속도 최적화)
-    df = df.sort_values(by='거래대금', ascending=False).head(100)
+    # 거래대금 상위 150개로 넉넉하게
+    df = df.sort_values(by='거래대금', ascending=False).head(150)
     
     ticker_list = df.index.tolist()
     name_map = {}
@@ -74,64 +73,7 @@ def get_market_data():
 
     return df
 
-# --- [핵심] 게릴라 수급 탐색기 (개별 종목 침투) ---
-# 전체 순위 페이지가 막히니, 대장주들의 '개별 페이지'를 하나씩 찔러서 가져옴
-@st.cache_data(ttl=600)
-def get_guerilla_supply(target_codes):
-    
-    supply_list = []
-    
-    # 네이버 모바일 페이지 (보안이 약함)
-    headers = {'User-Agent': 'Mozilla/5.0 (Linux; Android 10; K)'}
-    
-    def fetch_stock_supply(code, name):
-        url = f"https://m.finance.naver.com/item/frgn.naver?code={code}"
-        try:
-            res = requests.get(url, headers=headers, timeout=3)
-            # 테이블 찾기
-            dfs = pd.read_html(res.text)
-            if not dfs: return None
-            
-            # 첫 번째 테이블의 첫 번째 행 (가장 최근 날짜)
-            df = dfs[0]
-            latest = df.iloc[0] # 오늘 날짜 데이터
-            
-            # 데이터 추출 (날짜, 종가, 등락, 외국인, 기관)
-            # 네이버 모바일 구조: [날짜, 종가, 전일비, 등락률, 거래량, 기관, 외국인]
-            # 컬럼명이 바뀔 수 있으므로 위치로 접근하거나 이름 확인
-            
-            # 보통 '기관' '외국인' 글자가 포함된 컬럼을 찾음
-            inst_col = [c for c in df.columns if '기관' in c][0]
-            fore_col = [c for c in df.columns if '외국인' in c][0]
-            
-            inst_vol = int(str(latest[inst_col]).replace(',', ''))
-            fore_vol = int(str(latest[fore_col]).replace(',', ''))
-            
-            return {
-                '종목명': name,
-                '외국인': fore_vol,
-                '기관': inst_vol,
-                '합계': fore_vol + inst_vol
-            }
-        except:
-            return None
-
-    # 병렬 침투 시작 (속도 향상)
-    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
-        # code_list는 (code, name) 튜플 리스트여야 함
-        futures = [executor.submit(fetch_stock_supply, code, name) for code, name in target_codes]
-        
-        for future in concurrent.futures.as_completed(futures):
-            res = future.result()
-            if res: supply_list.append(res)
-            
-    if not supply_list: return pd.DataFrame()
-    
-    df = pd.DataFrame(supply_list)
-    df = df.sort_values(by='합계', ascending=False) # 쌍끌이 순 정렬
-    return df
-
-# --- 3. 통합 스캐너 ---
+# --- 3. 통합 스캐너 (목록용) ---
 def run_all_scanners(code_list):
     results = []
     progress_bar = st.progress(0)
@@ -140,124 +82,153 @@ def run_all_scanners(code_list):
     
     def analyze_one(code):
         try:
-            df = fdr.DataReader(code).tail(120)
-            if len(df) < 60: return None
-            
-            c = df['Close']
-            ma20 = c.rolling(20).mean()
-            ma60 = c.rolling(60).mean()
-            std = c.rolling(20).std()
-            band_w = ((ma20 + (std*2)) - (ma20 - (std*2))) / ma20
+            df = fdr.DataReader(code).tail(60)
+            if len(df) < 30: return None
             
             curr = df.iloc[-1]
-            prev = df.iloc[-2]
+            ma20 = df['Close'].rolling(20).mean().iloc[-1]
             
-            vol_avg = df['Volume'].rolling(5).mean().iloc[-1]
-            vol_ratio = (curr['Volume'] / vol_avg) * 100 if vol_avg > 0 else 0
-            
-            rsi = 100 - (100 / (1 + (c.diff().clip(lower=0).rolling(14).mean() / (-c.diff().clip(upper=0).rolling(14).mean()).replace(0, 1e-9)))).iloc[-1]
-            
+            # 간단 필터링
             tags = []
             score = 0
             
-            if curr['Close'] > ma60.iloc[-1] and abs(curr['Close'] - ma20.iloc[-1])/curr['Close'] < 0.03:
-                tags.append("🛡️안전빵")
-                score += 40
+            if curr['Close'] > ma20: 
+                tags.append("추세양호")
+                score += 10
             
-            if len(df) >= 3 and df.iloc[-3]['Close'] > df.iloc[-3]['Open'] and prev['Close'] < prev['Open'] and curr['Close'] > curr['Open']:
-                tags.append("🕯️양음양")
-                score += 30
-
+            vol_ratio = (curr['Volume'] / df['Volume'].rolling(5).mean().iloc[-1]) * 100
             if vol_ratio >= 200:
-                tags.append("💪거래폭발")
+                tags.append("거래폭발")
                 score += 20
-            
-            if band_w.iloc[-1] < 0.15:
-                tags.append("💥용수철")
-                score += 10
-            
-            if (curr['Open'] - prev['Close']) / prev['Close'] >= 0.03:
-                tags.append("🚀갭상승")
-                score += 10
-
-            if rsi <= 30:
-                tags.append("📉과낙폭")
-                score += 10
-
+                
             if tags:
                 return {'code': code, 'tags': ", ".join(tags), 'price': curr['Close'], 'score': score}
             return None
         except: return None
         
-    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
         futures = {executor.submit(analyze_one, code): code for code in code_list}
         for i, future in enumerate(concurrent.futures.as_completed(futures)):
             res = future.result()
             if res: results.append(res)
-            if i % 2 == 0:
+            if i % 10 == 0:
                 prog = (i + 1) / total
                 progress_bar.progress(prog)
-                status_text.caption(f"⚡ AI 분석 중... ({i+1}/{total})")
+                status_text.caption(f"⚡ 스캔 중... ({i+1}/{total})")
                 
     status_text.empty()
     progress_bar.empty()
     results.sort(key=lambda x: x['score'], reverse=True)
     return results
 
-# --- 4. 정밀 분석 ---
-def analyze_deep(code, name):
+# --- [핵심] 정밀 진단 AI 엔진 ---
+def analyze_deep_pro(code, name):
     try:
-        df = fdr.DataReader(code).tail(120)
+        # 넉넉하게 1년치 데이터
+        df = fdr.DataReader(code).tail(240)
+        if len(df) < 60:
+            return None, 0, [], "데이터 부족"
+
+        # 1. 보조지표 계산
+        c = df['Close']
+        # 이동평균선
+        ma5 = c.rolling(5).mean()
+        ma20 = c.rolling(20).mean()
+        ma60 = c.rolling(60).mean()
+        ma120 = c.rolling(120).mean()
         
-        delta = df['Close'].diff()
+        # 볼린저밴드
+        std = c.rolling(20).std()
+        upper = ma20 + (std * 2)
+        lower = ma20 - (std * 2)
+        bandwidth = (upper - lower) / ma20
+        
+        # RSI
+        delta = c.diff()
         gain = (delta.where(delta > 0, 0)).rolling(14).mean()
         loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
         rs = gain / loss
         rsi = 100 - (100 / (1 + rs))
+        
+        # MACD
+        exp12 = c.ewm(span=12, adjust=False).mean()
+        exp26 = c.ewm(span=26, adjust=False).mean()
+        macd = exp12 - exp26
+        signal = macd.ewm(span=9, adjust=False).mean()
+        
+        # 현재 값
+        curr_price = c.iloc[-1]
         curr_rsi = rsi.iloc[-1]
+        curr_vol = df['Volume'].iloc[-1]
+        avg_vol = df['Volume'].tail(5).mean()
         
-        high_p = df['High'].tail(60).max()
-        low_p = df['Low'].tail(60).min()
-        fibo_618 = high_p - ((high_p - low_p) * 0.618)
+        # 2. AI 점수 채점 (100점 만점)
+        score = 0
+        reasons = []
         
-        vol_ratio = (df['Volume'].iloc[-1] / df['Volume'].tail(5).mean()) * 100
+        # (1) 추세 점수 (40점)
+        if curr_price > ma20.iloc[-1]:
+            score += 20
+            reasons.append("✅ 단기 상승 추세 (20일선 위)")
+        if curr_price > ma60.iloc[-1]:
+            score += 10
+            reasons.append("✅ 중기 추세 살아있음 (60일선 위)")
+        if ma5.iloc[-1] > ma20.iloc[-1]: # 정배열 초입
+            score += 10
+            reasons.append("✅ 5일>20일 골든크로스 구간")
+            
+        # (2) 모멘텀/보조지표 (30점)
+        if 40 <= curr_rsi <= 70:
+            score += 10
+            reasons.append("✅ RSI 안정적 (과열 아님)")
+        elif curr_rsi < 30:
+            score += 20
+            reasons.append("🔥 RSI 과매도 (기술적 반등 위치)")
+            
+        if macd.iloc[-1] > signal.iloc[-1]:
+            score += 10
+            reasons.append("✅ MACD 매수 신호 유지")
+            
+        # (3) 거래량/패턴 (30점)
+        if curr_vol > avg_vol * 1.5:
+            score += 20
+            reasons.append("💪 거래량 실림 (수급 유입)")
         
-        df['Weekday'] = df.index.day_name()
-        weekday_stats = df.groupby('Weekday')['Close'].apply(lambda x: x.pct_change().mean() * 100)
-        days_order = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday']
-        weekday_stats = weekday_stats.reindex(days_order)
-        
-        fig = plt.figure(figsize=(10, 10))
-        gs = fig.add_gridspec(3, 1, height_ratios=[3, 1, 1])
+        if bandwidth.iloc[-1] < 0.15: # 밴드폭이 좁아짐 (힘 응축)
+            score += 10
+            reasons.append("⚡ 볼린저밴드 수축 (변동성 폭발 임박)")
+
+        # 3. 차트 그리기
+        fig = plt.figure(figsize=(10, 8))
+        gs = fig.add_gridspec(2, 1, height_ratios=[3, 1])
         
         ax1 = fig.add_subplot(gs[0])
-        ax1.plot(df.index, df['Close'], label='Price', color='blue')
-        ax1.plot(df.index, df['Close'].rolling(20).mean(), label='MA20', color='green', alpha=0.5)
-        ax1.axhline(fibo_618, color='orange', linestyle='--', label='Fibo 0.618')
-        ax1.set_title(f"Analysis: {code}")
+        ax1.plot(df.index, c, label='Price', color='black')
+        ax1.plot(df.index, ma20, label='MA20', color='green', alpha=0.7)
+        ax1.plot(df.index, ma60, label='MA60', color='orange', alpha=0.7)
+        ax1.plot(df.index, upper, color='gray', linestyle='--', alpha=0.3)
+        ax1.plot(df.index, lower, color='gray', linestyle='--', alpha=0.3)
+        ax1.set_title(f"Analysis: {name} ({code})")
         ax1.legend()
-        ax1.grid(alpha=0.3)
+        ax1.grid(True, alpha=0.2)
         
         ax2 = fig.add_subplot(gs[1])
-        ax2.plot(df.index, rsi, color='purple', label='RSI')
-        ax2.axhline(70, color='red', linestyle='--')
+        ax2.plot(df.index, rsi, label='RSI', color='purple')
         ax2.axhline(30, color='blue', linestyle='--')
+        ax2.axhline(70, color='red', linestyle='--')
         ax2.legend()
-        ax2.grid(alpha=0.3)
-        
-        ax3 = fig.add_subplot(gs[2])
-        colors = ['red' if v > 0 else 'blue' for v in weekday_stats.fillna(0).values]
-        ax3.bar(weekday_stats.index.str[:3], weekday_stats.fillna(0).values, color=colors)
-        ax3.set_title("Weekday Return (%)")
-        ax3.grid(alpha=0.3)
+        ax2.grid(True, alpha=0.2)
         
         plt.tight_layout()
-        return fig, curr_rsi, fibo_618, vol_ratio
-    except: return None, 0, 0, 0
+        
+        return fig, score, reasons, curr_price
+        
+    except Exception as e:
+        return None, 0, [], 0
 
 # --- 메인 UI ---
-st.title(f"⚔️ 단타 전투 머신 (Guerilla Mode)")
-st.caption(f"접속일: {display_date}")
+st.title(f"⚔️ 단타 전투 머신 (Chart Master)")
+st.caption(f"기준: {display_date}")
 
 c1, c2, c3 = st.columns(3)
 indices = {"KOSPI": "KS11", "KOSDAQ": "KQ11", "나스닥": "NQ=F"}
@@ -277,10 +248,11 @@ st.divider()
 all_df = get_market_data()
 
 if all_df.empty:
-    st.error("⚠️ 시세 데이터를 불러오지 못했습니다. 잠시 후 새로고침 해주세요.")
+    st.error("⚠️ 데이터 로드 실패. 잠시 후 다시 시도하세요.")
 else:
-    tab1, tab2, tab3, tab4, tab5 = st.tabs([
-        "🏆 스나이퍼", "📡 통합 스캐너(등급)", "💰 수급 포착(게릴라)", "🔮 정밀 분석", "📝 매매 일지"
+    # 탭 구성 (수급 탭 삭제 -> 정밀분석 강화)
+    tab1, tab2, tab3, tab4 = st.tabs([
+        "🏆 스나이퍼", "📡 통합 스캐너", "🩺 정밀 분석(진입판결)", "📝 매매 일지"
     ])
 
     def color_surplus(val):
@@ -291,7 +263,6 @@ else:
     # [Tab 1] 스나이퍼
     with tab1:
         st.markdown("### 🔫 오늘의 대장주")
-        
         t1 = all_df['거래대금(억)'] >= 200
         t2 = all_df['신호'].isin(["🔥돌파", "👀임박"])
         cand = all_df[t1 & t2].sort_values(by='등락률', ascending=False)
@@ -301,8 +272,7 @@ else:
             st.warning("😓 돌파 종목 없음. 상승률 1위 표시.")
         else:
             best = cand.iloc[0]
-            if "돌파" in best['신호']: st.success(f"🚀 **[{best['종목명']}]** 저항 돌파! 강력 매수")
-            else: st.warning(f"👀 **[{best['종목명']}]** 돌파 임박! 관망")
+            st.success(f"🚀 **[{best['종목명']}]** 포착! 대금 {best['거래대금(억)']}억")
 
         i1, i2, i3, i4 = st.columns(4)
         i1.metric("현재가", f"{best['종가']:,}")
@@ -311,18 +281,8 @@ else:
         i4.metric("대금", f"{best['거래대금(억)']}억")
         
         st.divider()
-        c_sort, c_blank = st.columns([1, 4])
-        with c_sort:
-            sort_opt = st.radio("정렬 기준", ["거래대금순", "등락률순"], horizontal=True)
-            
-        view_df = all_df.copy()
-        if sort_opt == "등락률순":
-            view_df = view_df.sort_values(by='등락률', ascending=False)
-        else:
-            view_df = view_df.sort_values(by='거래대금(억)', ascending=False)
-            
         st.dataframe(
-            view_df[['종목명', '종가', '등락률', '신호', '거래대금(억)']].style
+            all_df[['종목명', '종가', '등락률', '신호', '거래대금(억)']].head(50).style
             .format({'종가': '{:,}', '거래대금(억)': '{:,}', '등락률': '{:.2f}%'})
             .map(color_surplus, subset=['등락률']), 
             hide_index=True, use_container_width=True
@@ -331,109 +291,81 @@ else:
     # [Tab 2] 통합 스캐너
     with tab2:
         st.markdown("### 📡 AI 패턴 정밀 스캔")
-        st.caption("※ **S급(50점+) > A급(30점+) > B급** 순으로 보여줍니다.")
-        
-        if st.button("🚀 스캔 & 등급 판정"):
+        if st.button("🚀 스캔 시작"):
             scan_codes = all_df.index.tolist()
             results = run_all_scanners(scan_codes)
             
             if results:
-                st.toast(f"🔔 {len(results)}개 포착! S급부터 보여줍니다.", icon="🥇")
+                st.toast(f"🔔 {len(results)}개 포착!", icon="🥇")
                 for res in results:
                     name = all_df.loc[res['code']]['종목명']
                     price = res['price']
                     tags = res['tags']
                     score = res['score']
                     
-                    if score >= 50: st.markdown(f"### 🔴 S급 (강력 추천) - {name}")
-                    elif score >= 30: st.markdown(f"### 🟠 A급 (매수 우수) - {name}")
-                    else: st.markdown(f"### 🔵 B급 (관심 단계) - {name}")
-                    
-                    st.write(f"**가격:** {int(price):,}원 | **점수:** {score}점")
-                    st.info(f"👉 **포착 사유:** {tags}")
+                    st.markdown(f"**[{name}]** `{int(price):,}원`")
+                    st.info(f"👉 {tags}")
                     st.divider()
             else: st.info("특이 패턴 종목이 없습니다.")
 
-    # [Tab 3] 수급 포착 (게릴라 모드)
+    # [Tab 3] 정밀 분석 (수급 포기 -> 정밀 진단 기능 강화)
     with tab3:
-        st.markdown("### 🦁 대장주 수급 분석 (게릴라 침투)")
-        st.caption("※ 전체 랭킹이 차단되어, **오늘의 대장주 15개**를 개별적으로 정밀 타격하여 수급을 가져옵니다.")
+        st.markdown("### 🩺 AI 주치의 정밀 진단")
+        st.caption("※ 종목을 선택하고 **'진단 시작'**을 누르면, AI가 차트를 분석해 **진입 여부**를 알려줍니다.")
         
-        if st.button("💰 대장주 수급 털어오기"):
-            # 대장주 15개 선정 (거래대금 순)
-            top_stocks = all_df.head(15)[['종목명']]
-            target_codes = [(code, row['종목명']) for code, row in top_stocks.iterrows()]
-            
-            with st.spinner(f"Top 15 종목 수급 정밀 분석 중..."):
-                guerilla_df = get_guerilla_supply(target_codes)
-                
-                if not guerilla_df.empty:
-                    st.success(f"✅ **{len(guerilla_df)}개 종목** 수급 데이터 확보 성공!")
-                    
-                    st.dataframe(
-                        guerilla_df[['종목명', '외국인', '기관', '합계']].style
-                        .format({'외국인': '{:,}', '기관': '{:,}', '합계': '{:,}'})
-                        .map(color_surplus, subset=['외국인', '기관', '합계']),
-                        hide_index=True, use_container_width=True
-                    )
-                    
-                    # 해석
-                    best_buy = guerilla_df.iloc[0]
-                    if best_buy['합계'] > 0:
-                        st.info(f"💡 오늘의 수급 왕: **[{best_buy['종목명']}]** (외인/기관 합계 +{best_buy['합계']:,}주)")
-                else:
-                    st.error("❌ 모든 데이터 침투 실패. (IP 완전 차단됨)")
-                    st.warning("⚠️ 팁: 이 기능은 보안 정책상 '로컬 환경(내 컴퓨터)'에서 실행해야 가장 잘 작동합니다.")
-
-    # [Tab 4] 정밀 분석
-    with tab4:
+        # 종목 선택창
         opts = ["선택"] + [f"{r['종목명']} ({r['종가']:,})" for i, r in all_df.head(100).iterrows()]
-        sel = st.selectbox("종목 선택", opts)
+        sel = st.selectbox("진단할 종목 선택", opts)
         
         if sel != "선택":
             name = sel.split(' (')[0]
             code = all_df[all_df['종목명'] == name].index[0]
-            curr = all_df.loc[code]['종가']
-            st.info(f"💰 현재가: **{curr:,}원**")
             
-            mode = st.radio("기준", ["주수", "금액"], horizontal=True)
-            qty = 0
-            if mode == "주수":
-                q = st.number_input("주수", 1, 10000, 10)
-                st.caption(f"필요 금액: {q*curr:,}원")
-                qty = q
-            else:
-                m = st.number_input("금액", 10000, 100000000, 1000000)
-                qty = int(m // curr)
-                st.caption(f"매수 가능: {qty:,}주")
-                
-            if st.button("⚖️ AI 최종 판결 보기"):
-                fig, rsi, fibo, vol = analyze_deep(code, name)
-                if fig:
-                    score = 0
-                    reasons = []
-                    if 40 <= rsi <= 60: score += 20; reasons.append("안정적 흐름")
-                    elif rsi < 30: score += 30; reasons.append("과매도(반등기회)")
-                    elif rsi > 70: score -= 20; reasons.append("과매수(고점위험)")
-                    if vol > 150: score += 30; reasons.append("거래량 폭발")
-                    if all_df.loc[code]['등락률'] > 0: score += 20
+            # 진단 버튼
+            if st.button(f"🔍 '{name}' 정밀 진단 시작", type="primary"):
+                with st.spinner("AI가 차트를 뜯어보는 중입니다..."):
+                    fig, score, reasons, curr_price = analyze_deep_pro(code, name)
                     
-                    st.divider()
-                    st.subheader("🧑‍⚖️ AI 최종 판결")
-                    if score >= 70: st.success(f"✅ **[진입 승인]** 강력 매수 신호! ({score}점)")
-                    elif score >= 50: st.warning(f"⚠️ **[보류]** 확실하지 않습니다. ({score}점)")
-                    else: st.error(f"❌ **[진입 금지]** 위험합니다. ({score}점)")
-                    st.caption(f"이유: {', '.join(reasons)}")
-                    
-                    st.pyplot(fig)
-                    
-                    c1, c2, c3 = st.columns(3)
-                    c1.info(f"매수: {qty:,}주")
-                    c2.success(f"익절: {int(curr*1.03):,}")
-                    c3.error(f"손절: {int(curr*0.98):,}")
+                    if fig:
+                        st.divider()
+                        
+                        # 결과 표시 (점수판)
+                        c1, c2 = st.columns([2, 3])
+                        
+                        with c1:
+                            st.markdown("#### 🧑‍⚖️ AI 판결문")
+                            if score >= 80:
+                                st.error(f"👑 **S급 (강력 매수)**\n\n점수: **{score}점**")
+                                st.markdown("👉 **지금 당장 봐야 할 종목!** 추세/거래량 완벽.")
+                            elif score >= 60:
+                                st.warning(f"🥇 **A급 (매수 고려)**\n\n점수: **{score}점**")
+                                st.markdown("👉 **좋습니다.** 분할 매수로 접근하세요.")
+                            elif score >= 40:
+                                st.info(f"🥈 **B급 (관심)**\n\n점수: **{score}점**")
+                                st.markdown("👉 나쁘진 않은데, 확실한 신호를 기다리세요.")
+                            else:
+                                st.markdown(f"💀 **진입 금지**\n\n점수: **{score}점**")
+                                st.markdown("👉 **위험합니다.** 추세가 꺾였거나 거래량이 없습니다.")
+                            
+                            st.markdown("---")
+                            st.markdown("**[채점 사유]**")
+                            for r in reasons:
+                                st.write(r)
+                                
+                        with c2:
+                            st.pyplot(fig)
+                            
+                        # 전략 제안
+                        st.success(f"**[전략]** 현재가 {int(curr_price):,}원 기준")
+                        col_a, col_b = st.columns(2)
+                        col_a.info(f"🛑 손절가: {int(curr_price * 0.97):,}원 (-3%)")
+                        col_b.error(f"💰 목표가: {int(curr_price * 1.05):,}원 (+5%)")
+                        
+                    else:
+                        st.error("데이터 부족으로 분석할 수 없습니다.")
 
-    # [Tab 5] 매매 일지
-    with tab5:
+    # [Tab 4] 매매 일지
+    with tab4:
         st.markdown("### 📝 매매 복기장")
         with st.form("trade_form"):
             c1, c2, c3 = st.columns(3)
